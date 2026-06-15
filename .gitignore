@@ -1,0 +1,12 @@
+venv/
+.env
+__pycache__/
+*.pyc
+test_env/
+test_env_2/
+*.pdf
+.streamlit/secrets.toml
+db/
+data/extracted_images/
+data/extracted_tables/
+Queries.xlsx
