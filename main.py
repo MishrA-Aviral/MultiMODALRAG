@@ -57,16 +57,23 @@ def run_pipeline(excel_path: str = "Queries.xlsx"):
     print("Reading queries from Excel...")
     all_queries = read_queries(excel_path)
     answers = {}
-    for sheet, queries in all_queries.items():
-        print(f"\nProcessing {sheet} ({len(queries)} queries)...")
+    for sheet, sheet_data in all_queries.items():
+        queries = sheet_data["queries"]
+        source_filter = sheet_data["source"]
+        if source_filter:
+            print(f"\nProcessing {sheet} ({len(queries)} queries) "
+                  f"[source filter: {source_filter}]...")
+        else:
+            print(f"\nProcessing {sheet} ({len(queries)} queries) "
+                  f"[no source filter – searching all papers]...")
         sheet_answers = []
         for q in queries:
             print(f"  Q: {q}")
-            answer = answer_query(q, vectorstore)
+            answer = answer_query(q, vectorstore, source_filter=source_filter)
             print(f"  A: {answer[:150]}...")
             sheet_answers.append(answer)
             time.sleep(3)
-            
+
         answers[sheet] = sheet_answers
     print("\nWriting answers back to Excel...")
     write_answers(excel_path, answers)
