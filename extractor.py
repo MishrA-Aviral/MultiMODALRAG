@@ -1,3 +1,5 @@
+import base64
+import time
 import fitz
 import pdfplumber
 import sqlite3
@@ -65,6 +67,78 @@ def find_table_bboxes_by_alignment(page):
             
             bboxes.append((x0_tight, y0_tight, x1_tight, y1_tight))
     return bboxes
+
+
+def _describe_image_with_vision(filepath: str, fallback_caption: str) -> str:
+    """
+    Call the Groq vision API (llama-3.2-11b-vision-preview) to generate a rich
+    description of an extracted figure from the PDF.
+
+    The returned string combines the original caption with the vision model's
+    description so the FAISS index receives maximum textual context about the
+    image — enabling meaningful retrieval for figure-related queries.
+
+    Fails silently in ALL error cases (missing API key, rate limit, bad image,
+    network error) and returns the original fallback_caption unchanged, so this
+    function can never break the extraction pipeline.
+    """
+    try:
+        from groq import Groq
+
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            return fallback_caption
+
+        with open(filepath, "rb") as f:
+            img_bytes = f.read()
+
+        ext = os.path.splitext(filepath)[1].lower().lstrip(".")
+        mime_map = {
+            "jpg": "image/jpeg",
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "gif": "image/gif",
+            "webp": "image/webp",
+        }
+        mime_type = mime_map.get(ext, "image/png")
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"This is a figure from an academic research paper. "
+                                f'The figure caption reads: "{fallback_caption}". '
+                                f"Describe what you see in detail: chart type, axis labels, "
+                                f"numerical values, trends, structural elements, arrows, and "
+                                f"any text visible in the image. Be thorough so a reader can "
+                                f"understand this figure without seeing it."
+                            ),
+                        },
+                    ],
+                }
+            ],
+            max_tokens=400,
+        )
+
+        description = response.choices[0].message.content.strip()
+        # Prepend original caption so it is always present in the indexed text
+        return f"{fallback_caption}\n\nVision Description: {description}"
+
+    except Exception:
+        # Never let a vision API failure interrupt the extraction pipeline
+        return fallback_caption
+
 
 def extract_tables(pdf_path: str, db_path: str = "db/tables.db", output_dir: str = "data/extracted_tables") -> list:
     os.makedirs(output_dir, exist_ok=True)
@@ -336,12 +410,16 @@ def extract_images(pdf_path: str, output_dir: str = "data/extracted_images") -> 
                 filepath = os.path.join(output_dir, filename)
                 with open(filepath, "wb") as f:
                     f.write(img_bytes)
-                
+
+                raw_caption = best_cap if best_cap else f"Figure on page {i+1} of {os.path.basename(pdf_path)}"
+                enriched_caption = _describe_image_with_vision(filepath, raw_caption)
+                time.sleep(1)  # Respect Groq vision API rate limits between calls
+
                 image_records.append({
                     "source": os.path.basename(pdf_path),
                     "page": i + 1,
                     "image_path": filepath,
-                    "caption": best_cap if best_cap else f"Figure on page {i+1} of {os.path.basename(pdf_path)}",
+                    "caption": enriched_caption,
                     "bbox": (bbox.x0, bbox.y0, bbox.x1, bbox.y1)
                 })
                 page_extracted_xrefs.add(xref)
@@ -392,11 +470,15 @@ def extract_images(pdf_path: str, output_dir: str = "data/extracted_images") -> 
                             filepath = os.path.join(output_dir, filename)
                             pix.save(filepath)
                             
+                            raw_caption = cap["text"]
+                            enriched_caption = _describe_image_with_vision(filepath, raw_caption)
+                            time.sleep(1)  # Respect Groq vision API rate limits between calls
+
                             image_records.append({
                                 "source": os.path.basename(pdf_path),
                                 "page": i + 1,
                                 "image_path": filepath,
-                                "caption": cap["text"],
+                                "caption": enriched_caption,
                                 "bbox": (clip_rect.x0, clip_rect.y0, clip_rect.x1, clip_rect.y1)
                             })
                             print(f"  Extracted vector figure on page {i+1}: {cap['text'][:50]}...")
