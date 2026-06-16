@@ -18,8 +18,8 @@ reranker = CrossEncoder(
 )
 
 llm = ChatGroq(
-    model="llama-3.1-8b-instant",
-    temperature=0.3,
+    model="llama-3.3-70b-versatile",
+    temperature=0.1,
     max_tokens=2048,
     api_key=os.getenv("GROQ_API_KEY")
 )
@@ -102,24 +102,52 @@ def is_table_query(query: str) -> bool:
     return any(term in q for term in table_keywords)
 
 
+# Keywords that strongly signal the user wants a textual discussion/explanation
+_ANALYTICAL_KEYWORDS = [
+    "discuss", "explain", "why", "how does", "tradeoff", "trade-off",
+    "reason", "suggest", "imply", "what does this", "elaborate",
+    "describe", "what is the", "what are the", "relationship"
+]
+
+
+def _is_analytical_query(query: str) -> bool:
+    """Return True if the query asks for explanation/discussion, not just a lookup."""
+    q = query.lower()
+    return any(term in q for term in _ANALYTICAL_KEYWORDS)
+
+
 def _query_mode(query: str) -> str:
     """
-    Return one of: 'table', 'image', 'text'
+    Return one of: 'hybrid', 'table', 'image', 'text'.
+
+    'hybrid' is used when the query has table-related keywords but ALSO asks
+    for discussion/explanation — meaning the LLM needs both table data AND
+    surrounding prose to give a complete answer.
     """
-    if is_table_query(query):
-        return "table"
     if is_image_query(query):
         return "image"
+    if is_table_query(query):
+        # If the query also wants analysis/discussion, use hybrid mode so
+        # text context is always included alongside the tables.
+        if _is_analytical_query(query):
+            return "hybrid"
+        return "table"
     return "text"
 
 
 def _matches_source(doc, source_filter: str) -> bool:
     """
-    Return True if the doc's source metadata matches the filter filename.
+    Return True if the doc's source metadata matches the filter.
+    Tries normalized full-path comparison first; falls back to basename
+    comparison so that queries work whether the index stores full paths
+    or bare filenames.
     """
-    import os
-    doc_source = os.path.basename(doc.metadata.get("source", ""))
-    return doc_source == os.path.basename(source_filter)
+    doc_src = doc.metadata.get("source", "")
+    # Primary: normalized path equality
+    if os.path.normpath(doc_src) == os.path.normpath(source_filter):
+        return True
+    # Fallback: basename equality (handles mixed absolute/relative storage)
+    return os.path.basename(doc_src) == os.path.basename(source_filter)
 
 
 def _unique_docs(docs: list) -> list:
@@ -171,18 +199,24 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
 
     raw_docs = _unique_docs(raw_docs)
 
-    if mode == "table":
+    if mode in ("table", "hybrid"):
         table_docs = []
         seen_content = set()
 
         # --- HYBRID SEARCH: FAISS + BM25 ---
         table_pool_k = 12 if source_filter is None else 16
         faiss_table_docs = vectorstore.similarity_search(query, k=table_pool_k)
-        
+
         bm25_docs = []
         if bm25_retriever is not None:
-            # BM25 is excellent for exact keyword matches (e.g. "FUNSD F1")
-            bm25_docs = bm25_retriever.invoke(query)
+            # BM25 is excellent for exact keyword matches (e.g. "FUNSD F1").
+            # FIX #4: Apply source filter to BM25 results BEFORE interleaving
+            # so that irrelevant-paper tables don't consume context slots.
+            bm25_raw = bm25_retriever.invoke(query)
+            if source_filter:
+                bm25_docs = [d for d in bm25_raw if _matches_source(d, source_filter)]
+            else:
+                bm25_docs = bm25_raw
 
         # Interleave Dense (FAISS) and Sparse (BM25) results
         combined_raw = []
@@ -210,16 +244,22 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
         if not table_docs:
             table_docs = [d for d in raw_docs if d.metadata.get("type") == "table"]
 
-        if len(table_docs) < 4:
-            for doc in raw_docs:
-                if doc.metadata.get("type") == "text" and doc.page_content.strip() not in seen_content:
-                    table_docs.append(doc)
-                    seen_content.add(doc.page_content.strip())
-                if len(table_docs) >= 6:
-                    break
+        # FIX #2: Always reserve 2 slots for top text docs so the LLM has
+        # prose context for analytical questions. Previously text was only
+        # added when table_docs < 4, which almost never triggered.
+        text_candidates = [
+            d for d in raw_docs
+            if d.metadata.get("type") == "text"
+            and d.page_content.strip() not in seen_content
+        ]
+        # Rerank text candidates so the most relevant prose comes first
+        top_text = rerank_docs(query, _unique_docs(text_candidates), top_n=2)
+        for doc in top_text:
+            seen_content.add(doc.page_content.strip())
+        table_docs = _unique_docs(table_docs) + top_text
 
         # BYPASS CROSS-ENCODER RERANKER FOR TABLES (It destroys markdown)
-        return _unique_docs(table_docs)[:6]
+        return table_docs[:6]
 
     if mode == "image":
         image_docs = [d for d in raw_docs if d.metadata.get("type") == "image"]
@@ -313,50 +353,81 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
 
     context = "\n\n".join(formatted_contexts)
 
-    MAX_CONTEXT_CHARS = 9000 if mode == "table" else 6500
+    # FIX #5: Truncate between document blocks, not mid-string.
+    # This prevents the LLM from receiving a half-cut markdown table row.
+    MAX_CONTEXT_CHARS = 9000 if mode in ("table", "hybrid") else 6500
     if len(context) > MAX_CONTEXT_CHARS:
-        context = context[:MAX_CONTEXT_CHARS] + "\n\n[... context truncated ...]"
+        # Walk backwards from the char limit to find the nearest block boundary
+        cutoff = context.rfind("\n\n", 0, MAX_CONTEXT_CHARS)
+        if cutoff == -1:
+            cutoff = MAX_CONTEXT_CHARS
+        context = context[:cutoff] + "\n\n[... context truncated ...]"
 
-    if mode == "table":
-        prompt = f"""You are an expert data analyst. Use ONLY the provided context to answer.
+    # FIX #11: Choose prompt based on whether the question is analytical.
+    # 'hybrid' mode queries explicitly need discussion, not just cell lookups.
+    _needs_discussion = (mode == "hybrid") or _is_analytical_query(query)
 
-Context:
-{context}
+    if mode in ("table", "hybrid") and not _needs_discussion:
+        # Pure lookup: find the exact cell value
+        prompt = f"""You are a precise data analyst. Answer using ONLY the provided context.
 
-Question: {query}
+        Context:
+        {context}
 
-Instructions:
-1. Identify the exact table, row, and column needed.
-2. Trace the intersection carefully.
-3. If the value is missing, explicitly state "Not provided in context".
-4. Write your step-by-step reasoning inside <thinking> tags.
-5. Provide the final, exact answer outside the tags.
+        Question: {query}
 
-Answer:"""
+        - Identify the correct table, row and column.
+        - Quote the exact value from the table.
+        - If the value is not in the context, say "Not found in context".
+
+        Answer:"""
+    elif mode in ("table", "hybrid") and _needs_discussion:
+        # Analytical: compare, explain, discuss using both tables AND text
+        prompt = f"""You are an expert research analyst. Answer using ONLY the provided context.
+
+        The context contains both TABLE data and TEXT passages from the paper.
+        Use both to give a complete, accurate answer.
+
+        Context:
+        {context}
+
+        Question: {query}
+
+        Instructions:
+        - Quote exact numbers from tables where relevant.
+        - Use the text passages to explain tradeoffs, reasons, and implications.
+        - Structure your answer clearly: state the finding, then the comparison/discussion.
+        - Do NOT invent any numbers or claims not present in the context.
+
+        Answer:"""
     elif mode == "image":
-        prompt = f"""Answer the question using ONLY the context.
+        prompt = f"""You are an expert at reading research paper figures.
+        The context below contains figure captions AND detailed Vision Descriptions
+        generated by analysing the actual image. Use ALL of this information to answer.
 
-For figure/image questions:
-- Use the caption and nearby text only.
-- If the visual content is not available, say that clearly.
-- Do not invent details.
+        Context:
+        {context}
 
-Context:
-{context}
+        Question: {query}
 
-Question: {query}
+        Instructions:
+        - Use the Vision Description to answer questions about what the figure shows.
+        - Quote specific details: axis labels, values, trends, structural elements.
+        - If a specific detail is genuinely not mentioned anywhere in the context, say so.
+        - Do NOT say "visual content is not available" — use the Vision Description instead.
 
-Answer in a short, direct form:"""
+        Answer:"""
     else:
         prompt = f"""Answer the question using ONLY the context.
-Do not invent facts. If the context is insufficient, say so.
+        Do not invent facts. If the context is insufficient, say so.
+        Be specific — mention exact names, numbers, and benchmarks where available.
 
-Context:
-{context}
+        Context:
+        {context}
 
-Question: {query}
+        Question: {query}
 
-Answer in a short, direct form:"""
+        Answer:"""  
 
     response = _invoke_llm_with_retry(prompt)
     answer = response.content.strip()
