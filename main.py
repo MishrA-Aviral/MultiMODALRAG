@@ -18,6 +18,8 @@ def index_papers(papers_dir: str = "data/papers", reset_index: bool = True):
             shutil.rmtree("db/faiss_index")
         if os.path.exists("db/tables.db"):
             os.remove("db/tables.db")
+        if os.path.exists("db/bm25_tables.pkl"):
+            os.remove("db/bm25_tables.pkl")
         # Also clean up previously extracted artifacts
         if os.path.exists("data/extracted_tables"):
             shutil.rmtree("data/extracted_tables")

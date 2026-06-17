@@ -71,73 +71,50 @@ def find_table_bboxes_by_alignment(page):
 
 def _describe_image_with_vision(filepath: str, fallback_caption: str) -> str:
     """
-    Call the Groq vision API (llama-3.2-11b-vision-preview) to generate a rich
-    description of an extracted figure from the PDF.
+    Use PaddleOCR to extract all text visible inside an image (figure/chart from
+    a research paper) and combine it with the surrounding caption text so the
+    FAISS index receives rich, searchable content about each figure.
 
-    The returned string combines the original caption with the vision model's
-    description so the FAISS index receives maximum textual context about the
-    image — enabling meaningful retrieval for figure-related queries.
+    This is a fully local, lightweight operation — no vision LLM, no API key,
+    no GPU required. PaddleOCR reads axis labels, legend entries, numerical
+    values, and any other text embedded in the image.
 
-    Fails silently in ALL error cases (missing API key, rate limit, bad image,
-    network error) and returns the original fallback_caption unchanged, so this
-    function can never break the extraction pipeline.
+    Falls back to the original fallback_caption silently on any error.
     """
     try:
-        from groq import Groq
+        from paddleocr import PaddleOCR
+        import numpy as np
+        from PIL import Image
 
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
+        # Initialise with English; use_angle_cls catches rotated chart labels.
+        # show_log=False suppresses PaddlePaddle's verbose startup output.
+        ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+
+        img = Image.open(filepath).convert("RGB")
+        img_array = np.array(img)
+
+        result = ocr.ocr(img_array, cls=True)
+
+        # result is a list-of-pages; we always pass a single image so index [0]
+        extracted_lines = []
+        if result and result[0]:
+            for line in result[0]:
+                # Each line: [[bbox_points], (text, confidence)]
+                text, confidence = line[1]
+                if confidence > 0.5 and text.strip():
+                    extracted_lines.append(text.strip())
+
+        if not extracted_lines:
+            # Image contained no legible text — return caption as-is
             return fallback_caption
 
-        with open(filepath, "rb") as f:
-            img_bytes = f.read()
-
-        ext = os.path.splitext(filepath)[1].lower().lstrip(".")
-        mime_map = {
-            "jpg": "image/jpeg",
-            "jpeg": "image/jpeg",
-            "png": "image/png",
-            "gif": "image/gif",
-            "webp": "image/webp",
-        }
-        mime_type = mime_map.get(ext, "image/png")
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:{mime_type};base64,{b64}"},
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"This is a figure from an academic research paper. "
-                                f'The figure caption reads: "{fallback_caption}". '
-                                f"Describe what you see in detail: chart type, axis labels, "
-                                f"numerical values, trends, structural elements, arrows, and "
-                                f"any text visible in the image. Be thorough so a reader can "
-                                f"understand this figure without seeing it."
-                            ),
-                        },
-                    ],
-                }
-            ],
-            max_tokens=400,
-        )
-
-        description = response.choices[0].message.content.strip()
-        # Prepend original caption so it is always present in the indexed text
-        return f"{fallback_caption}\n\nVision Description: {description}"
+        ocr_text = " | ".join(extracted_lines)
+        return f"{fallback_caption}\n\nOCR Text: {ocr_text}"
 
     except Exception:
-        # Never let a vision API failure interrupt the extraction pipeline
+        # Never let an OCR failure interrupt the extraction pipeline
         return fallback_caption
+
 
 
 def extract_tables(pdf_path: str, db_path: str = "db/tables.db", output_dir: str = "data/extracted_tables") -> list:

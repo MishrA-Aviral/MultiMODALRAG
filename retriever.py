@@ -7,6 +7,9 @@ import re
 import os
 import time
 import pickle
+import pandas as pd
+import io
+from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 
 bm25_retriever = None
 
@@ -45,6 +48,29 @@ def _normalize_row(row: str) -> str:
     row_no_refs = re.sub(r"\[\d+\]", "", row)
     row_no_refs = re.sub(r"\s+", " ", row_no_refs).strip()
     return row_no_refs
+
+
+def markdown_to_dataframe(md_string: str) -> pd.DataFrame:
+    """
+    Safely parse a markdown table string into a pandas DataFrame.
+    """
+    lines = [line.strip() for line in md_string.split('\n') if line.strip().startswith('|')]
+    if not lines:
+        return pd.DataFrame()
+    # Remove the separator row (e.g. |---|---|)
+    lines = [line for line in lines if not set(line.replace('|', '').replace(' ', '')) == {'-'}]
+    # Parse as CSV using | separator
+    csv_str = '\n'.join(lines)
+    # Remove leading/trailing |
+    csv_str = '\n'.join([line.strip('|') for line in csv_str.split('\n')])
+    try:
+        df = pd.read_csv(io.StringIO(csv_str), sep='|')
+        # Strip whitespace from column names and string cells
+        df.columns = df.columns.str.strip()
+        df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+        return df
+    except Exception:
+        return pd.DataFrame()
 
 
 def clean_table_markdown(content: str) -> str:
@@ -218,13 +244,28 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
             else:
                 bm25_docs = bm25_raw
 
-        # Interleave Dense (FAISS) and Sparse (BM25) results
+        # Interleave Dense (FAISS) and Sparse (BM25) results — BM25 gets 2:1 priority.
+        # For exact-metric queries ("mAP", "FUNSD F1"), BM25 keyword hits surface the
+        # correct table more reliably than semantic vectors, so we emit two BM25 docs
+        # for every one FAISS doc before moving to the next FAISS candidate.
         combined_raw = []
-        for d1, d2 in zip(bm25_docs, faiss_table_docs):
-            combined_raw.extend([d1, d2])
-        combined_raw.extend(faiss_table_docs[len(bm25_docs):])
-        combined_raw.extend(bm25_docs[len(faiss_table_docs):])
+        faiss_idx = 0
+        bm25_idx = 0
+        while bm25_idx < len(bm25_docs) or faiss_idx < len(faiss_table_docs):
+            # Emit up to 2 BM25 candidates first
+            for _ in range(2):
+                if bm25_idx < len(bm25_docs):
+                    combined_raw.append(bm25_docs[bm25_idx])
+                    bm25_idx += 1
+            # Then emit 1 FAISS candidate
+            if faiss_idx < len(faiss_table_docs):
+                combined_raw.append(faiss_table_docs[faiss_idx])
+                faiss_idx += 1
 
+        # Secondary dedup key on raw_table_markdown: after the table summarization
+        # refactor, page_content holds a prose summary. Two docs with different
+        # summaries but identical underlying grids must not both consume a slot.
+        seen_raw_markdown: set = set()
         for doc in combined_raw:
             if doc.metadata.get("type") != "table":
                 continue
@@ -232,11 +273,13 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
                 continue
 
             content = doc.page_content.strip()
-            if content in seen_content:
+            raw_md = doc.metadata.get("raw_table_markdown", content)
+            if content in seen_content or raw_md in seen_raw_markdown:
                 continue
 
             table_docs.append(doc)
             seen_content.add(content)
+            seen_raw_markdown.add(raw_md)
 
             if len(table_docs) >= 4:
                 break
@@ -252,8 +295,22 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
             if d.metadata.get("type") == "text"
             and d.page_content.strip() not in seen_content
         ]
-        # Rerank text candidates so the most relevant prose comes first
-        top_text = rerank_docs(query, _unique_docs(text_candidates), top_n=2)
+        # Dynamic context allocation slider.
+        # Pure table lookups ("what is the highest F1?") get zero prose slots so
+        # all 6 return positions are available for dense table data.
+        # Analytical and hybrid queries still reserve prose for explanation.
+        if mode == "hybrid":
+            text_slots = 2
+        elif _is_analytical_query(query):
+            text_slots = 1
+        else:
+            text_slots = 0  # pure lookup — give every slot to tables
+
+        top_text = (
+            rerank_docs(query, _unique_docs(text_candidates), top_n=text_slots)
+            if text_slots > 0
+            else []
+        )
         for doc in top_text:
             seen_content.add(doc.page_content.strip())
         table_docs = _unique_docs(table_docs) + top_text
@@ -270,7 +327,9 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
     text_docs = [d for d in raw_docs if d.metadata.get("type") == "text"]
     if not text_docs:
         text_docs = raw_docs
-    return rerank_docs(query, _unique_docs(text_docs), top_n=5)
+    return rerank_docs(query, _unique_docs(text_docs), top_n=5)    
+
+    
 
 
 def get_page_docs(vectorstore, page_num: int, source_filter: str = None) -> list:
@@ -331,11 +390,16 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
             path = doc.metadata.get("table_path", "")
             if path:
                 referenced_tables.append(path)
-            
-            # BYPASS DEDUPLICATION: Pass raw Markdown directly to LLM
+
+            # Use the pristine raw markdown matrix for LLM context.
+            # FAISS indexes a prose summary (better embedding), but the LLM
+            # must receive the original grid so it can read exact cell values.
+            # Fall back to page_content for records indexed before this change.
+            raw_markdown = doc.metadata.get("raw_table_markdown", doc.page_content)
             formatted_contexts.append(
-                f"[TABLE | p.{page} | {source}]\n{doc.page_content}"
+                f"[TABLE | p.{page} | {source}]\n{raw_markdown}"
             )
+
 
         elif doc_type == "image":
             path = doc.metadata.get("image_path", "")
@@ -368,8 +432,42 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
     _needs_discussion = (mode == "hybrid") or _is_analytical_query(query)
 
     if mode in ("table", "hybrid") and not _needs_discussion:
-        # Pure lookup: find the exact cell value
-        prompt = f"""You are a precise data analyst. Answer using ONLY the provided context.
+        # PANDAS CODE-GEN AGENT (Program-Aided Language)
+        # Instead of asking the LLM to 'read' the text matrix, we formally parse
+        # the retrieved tables into DataFrames and let the LLM generate/execute Python.
+        
+        dfs = []
+        for doc in docs:
+            if doc.metadata.get("type") == "table":
+                raw_md = doc.metadata.get("raw_table_markdown", doc.page_content)
+                df = markdown_to_dataframe(raw_md)
+                if not df.empty:
+                    dfs.append(df)
+                    
+        if dfs:
+            try:
+                # Use zero-shot-react-description since tool-calling is less stable on Groq
+                agent = create_pandas_dataframe_agent(
+                    llm, 
+                    dfs, 
+                    verbose=False,
+                    allow_dangerous_code=True,
+                    agent_type="zero-shot-react-description",
+                    max_iterations=4
+                )
+                answer = agent.invoke({"input": f"Answer in MAXIMUM ONE SENTENCE with the exact value or metric. Do not include any explanations or code. Query: {query}"})
+                answer_text = answer.get("output", str(answer))
+                
+                if "[Source Table:" not in answer_text and referenced_tables:
+                    answer_text += f"\n\n[Source Table: {referenced_tables[0]}]"
+                return answer_text
+            except Exception as e:
+                # Fallback to standard prompt if the agent hits a parsing error or iteration limit
+                print(f"Pandas Agent failed ({e}), falling back to standard LLM table lookup...")
+                pass
+                
+        # Pure lookup fallback prompt if agent failed or no valid DFS parsed
+        prompt = f"""You are a precise data analyst. Answer using ONLY the provided context in MAXIMUM ONE SENTENCE. Do not explain.
 
         Context:
         {context}
@@ -438,3 +536,20 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
         answer += f"\n\n[Source Image: {referenced_images[0]}]"
 
     return answer
+
+# --- TEST 3: BM25 Tokenizer Check ---
+if __name__ == "__main__":
+    print("Loading indices for Test 3...")
+    vs = load_index()  # This initializes both FAISS and BM25
+    
+    test_query = "mAP@[.5, .95]"
+    print(f"Executing sparse keyword search for: {test_query}")
+    
+    if bm25_retriever is not None:
+        results = bm25_retriever.invoke(test_query)
+        print(f"Test 3 Passed: BM25 found {len(results)} results!")
+        if results:
+            print(f"Top Match Snippet: {results[0].page_content[:80]}...")
+    else:
+        print("BM25 Retriever is not initialized. Make sure db/bm25_tables.pkl exists.")
+# ------------------------------------
