@@ -5,12 +5,7 @@ def read_queries(filepath: str) -> dict:
     """Read queries from all sheets in the Excel file.
 
     Returns:
-        A dict mapping sheet name → {"queries": [str, ...], "source": str | None}.
-
-        "source" is the PDF filename (e.g. "2204.08387v3.pdf") used to restrict
-        retrieval to a single paper.  It is read from column C, whose header must
-        be "Source".  The first non-null value in that column is used for the whole
-        sheet.  If the column is absent or empty, "source" is None (no filtering).
+        A dict mapping sheet name → list of dicts: [{"query": str, "source": str | None}, ...]
     """
     xl = pd.ExcelFile(filepath)
     all_queries = {}
@@ -19,16 +14,18 @@ def read_queries(filepath: str) -> dict:
         if "Query" not in df.columns:
             continue
 
-        queries = df["Query"].dropna().tolist()
+        sheet_queries = []
+        has_source = "Source" in df.columns
+        for _, row in df.iterrows():
+            q = row.get("Query")
+            if pd.isna(q):
+                continue
+            src = None
+            if has_source and not pd.isna(row.get("Source")):
+                src = str(row.get("Source")).strip()
+            sheet_queries.append({"query": str(q), "source": src})
 
-        # Read optional Source column (first non-null value applies to the sheet)
-        source = None
-        if "Source" in df.columns:
-            source_vals = df["Source"].dropna().tolist()
-            if source_vals:
-                source = str(source_vals[0]).strip()
-
-        all_queries[sheet] = {"queries": queries, "source": source}
+        all_queries[sheet] = sheet_queries
     return all_queries
 
 
@@ -51,7 +48,7 @@ def write_answers(filepath: str, answers: dict):
 
 if __name__ == "__main__":
     queries = read_queries("Queries.xlsx")
-    for sheet, data in queries.items():
-        print(f"Sheet: {sheet}  |  Source filter: {data['source']}")
-        for q in data["queries"]:
-            print(f"  - {q[:80]}...")
+    for sheet, qs in queries.items():
+        print(f"Sheet: {sheet}")
+        for item in qs:
+            print(f"  - {item['query'][:80]}... [Source: {item['source']}]")

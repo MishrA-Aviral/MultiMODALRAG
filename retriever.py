@@ -57,8 +57,22 @@ def markdown_to_dataframe(md_string: str) -> pd.DataFrame:
     lines = [line.strip() for line in md_string.split('\n') if line.strip().startswith('|')]
     if not lines:
         return pd.DataFrame()
-    # Remove the separator row (e.g. |---|---|)
-    lines = [line for line in lines if not set(line.replace('|', '').replace(' ', '')) == {'-'}]
+        
+    # Find the separator row
+    sep_idx = -1
+    for i, line in enumerate(lines):
+        if set(line.replace('|', '').replace(' ', '')) == {'-'}:
+            sep_idx = i
+            break
+            
+    if sep_idx > 1:
+        # Multi-row header detected. Skip pandas-agent by returning empty df.
+        return pd.DataFrame()
+        
+    # Remove the separator row
+    if sep_idx != -1:
+        lines = [line for i, line in enumerate(lines) if i != sep_idx]
+        
     # Parse as CSV using | separator
     csv_str = '\n'.join(lines)
     # Remove leading/trailing |
@@ -67,6 +81,12 @@ def markdown_to_dataframe(md_string: str) -> pd.DataFrame:
         df = pd.read_csv(io.StringIO(csv_str), sep='|')
         # Strip whitespace from column names and string cells
         df.columns = df.columns.str.strip()
+        
+        # Detect unusable headers (lots of Unnamed)
+        unnamed = sum(1 for c in df.columns if str(c).startswith("Unnamed:"))
+        if unnamed > len(df.columns) / 2:
+            return pd.DataFrame()
+            
         df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
         return df
     except Exception:
@@ -458,13 +478,36 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
                 answer = agent.invoke({"input": f"Answer in MAXIMUM ONE SENTENCE with the exact value or metric. Do not include any explanations or code. Query: {query}"})
                 answer_text = answer.get("output", str(answer))
                 
-                if "[Source Table:" not in answer_text and referenced_tables:
-                    answer_text += f"\n\n[Source Table: {referenced_tables[0]}]"
-                return answer_text
+                # BUG 2: Sanity check agent output
+                rejected = False
+                if "|" in answer_text or "(#:" in answer_text or "Agent stopped" in answer_text:
+                    rejected = True
+                else:
+                    # Extract words and numbers from answer
+                    ans_tokens = set(re.findall(r'\b[a-zA-Z0-9.\-]+\b', answer_text))
+                    # Combine raw markdown
+                    raw_md = " ".join([doc.metadata.get("raw_table_markdown", doc.page_content) for doc in docs if doc.metadata.get("type") == "table"])
+                    # Check if at least one meaningful token appears in the raw table markdown
+                    if "not found" not in answer_text.lower():
+                        has_overlap = False
+                        for t in ans_tokens:
+                            if len(t) > 1 or t.isdigit():
+                                if t in raw_md:
+                                    has_overlap = True
+                                    break
+                        if not has_overlap and ans_tokens:
+                            rejected = True
+                
+                if not rejected:
+                    if "[Source Table:" not in answer_text and referenced_tables:
+                        answer_text += f"\n\n[Source Table: {referenced_tables[0]}]"
+                    return answer_text
+                else:
+                    print("Pandas Agent returned invalid output or stopped, falling back to standard LLM table lookup...")
+                    
             except Exception as e:
                 # Fallback to standard prompt if the agent hits a parsing error or iteration limit
                 print(f"Pandas Agent failed ({e}), falling back to standard LLM table lookup...")
-                pass
                 
         # Pure lookup fallback prompt if agent failed or no valid DFS parsed
         prompt = f"""You are a precise data analyst. Answer using ONLY the provided context in MAXIMUM ONE SENTENCE. Do not explain.
