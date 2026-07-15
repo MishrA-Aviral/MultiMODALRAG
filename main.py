@@ -35,7 +35,7 @@ def index_papers(papers_dir: str = "data/papers", reset_index: bool = True):
         print(f"    {len(tables)} tables extracted")
         
         print("  Step 2: Extracting images and matching captions...")
-        images = extract_images(pdf_path)
+        images = extract_images(pdf_path, table_records=tables)
         print(f"    {len(images)} images extracted")
         
         print("  Step 3: Extracting clean text (filtering layout tables)...")
@@ -61,20 +61,30 @@ def run_pipeline(excel_path: str = "Queries.xlsx"):
     answers = {}
     for sheet, queries in all_queries.items():
         print(f"\nProcessing {sheet} ({len(queries)} queries)...")
-        sheet_answers = []
-        for item in queries:
+        # Pre-fill sheet_answers with existing answers or empty strings
+        sheet_answers = ["" for _ in queries]
+        
+        for idx, item in enumerate(queries):
             q = item["query"]
             source_filter = item["source"]
             print(f"  Q: {q} [filter: {source_filter}]")
-            answer = answer_query(q, vectorstore, source_filter=source_filter)
-            print(f"  A: {answer[:150]}...")
-            sheet_answers.append(answer)
+            
+            try:
+                answer = answer_query(q, vectorstore, source_filter=source_filter)
+                print(f"  A: {answer[:150]}...")
+            except Exception as e:
+                print(f"  [ERROR] {e}")
+                answer = f"ERROR: {e}"
+                
+            sheet_answers[idx] = answer
+            answers[sheet] = sheet_answers
+            
+            # Incremental save: write to Excel after every single query!
+            write_answers(excel_path, answers)
+            
             time.sleep(3)
 
-        answers[sheet] = sheet_answers
-    print("\nWriting answers back to Excel...")
-    write_answers(excel_path, answers)
-    print("Done! Open Queries.xlsx to see answers.")
+    print("\nDone! Open Queries.xlsx to see answers.")
 
 if __name__ == "__main__":
     import sys

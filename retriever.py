@@ -3,10 +3,13 @@ from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from sentence_transformers import CrossEncoder
 from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage
 import re
 import os
 import time
 import pickle
+import json
+import numpy as np
 import pandas as pd
 import io
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
@@ -127,10 +130,188 @@ def clean_table_markdown(content: str) -> str:
     return "\n".join(cleaned)
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STATISTICAL COMPUTATION LAYER
+# Runs AFTER retrieval but BEFORE the LLM answer step. When a query asks for
+# a statistical operation over table data, Python computes the answer exactly.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STAT_OPERATIONS = [
+    # Each entry: (operation_name, trigger_keywords)
+    # Ordered longest-phrase-first to avoid false matches.
+    ("weighted_mean", ["weighted average", "weighted mean"]),
+    ("mean",          ["average", "mean", "avg"]),
+    ("median",        ["median"]),
+    ("mode",          ["most common", "most frequent", "mode"]),
+    ("range",         ["range", "spread", "min to max"]),
+    ("std",           ["standard deviation", "std dev", "std"]),
+    ("percentile",    ["percentile", "quantile"]),
+    ("delta",         ["delta", "gain", "improvement", "difference", "change",
+                       "increased by", "decreased by", "how much did"]),
+]
+
+
+def detect_stat_operation(query: str) -> str | None:
+    """
+    Return the name of the statistical operation requested in the query,
+    or None if the query is not asking for one.
+
+    Uses word-boundary matching for single-word keywords to prevent partial
+    matches (e.g. "mode" must not match inside "models").
+    """
+    q = query.lower()
+    for op, keywords in _STAT_OPERATIONS:
+        for kw in sorted(keywords, key=len, reverse=True):
+            if ' ' in kw:
+                if kw in q:
+                    return op
+            else:
+                if re.search(r'\b' + re.escape(kw) + r'\b', q):
+                    return op
+    return None
+
+
+def _llm_extract_values(query: str, raw_md: str, operation: str) -> list[float] | None:
+    """
+    Use the LLM strictly as a table reader to extract the exact numeric values
+    needed for Python to compute the statistic.
+
+    This approach:
+    - Handles PyMuPDF column-shift artifacts (messy markdown) gracefully.
+    - Handles natural-language row filters ("only BASE models", "ensemble only").
+    - Keeps all actual math in Python (numpy), not the LLM.
+
+    Returns a list of floats on success, or None / [] if the table doesn't
+    contain the requested data (so compute_stat moves to the next candidate).
+    """
+    prompt = (
+        f"You are a precise data extractor.\n"
+        f"The user wants to perform a '{operation}' statistical operation based on this query:\n"
+        f"Query: \"{query}\"\n\n"
+        f"Here is the markdown table:\n{raw_md}\n\n"
+        f"Extract the EXACT numerical values from the table needed to compute this statistic.\n"
+        f"Rules:\n"
+        f"- For aggregate operations (mean/median/mode/range/std/percentile): extract ALL relevant values from the correct column, filtered to the rows the query specifies (e.g. 'all BASE models', 'all ensemble methods').\n"
+        f"- For delta/gain/difference: extract exactly two values in order [from_value, to_value].\n"
+        f"- If this table does NOT contain the data the query refers to, return: []\n\n"
+        f"Return ONLY a valid JSON list of floats. No explanation, no markdown, no code blocks.\n"
+    )
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+        # Strip any accidental markdown fences
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        values = json.loads(raw)
+        if isinstance(values, list):
+            return [float(v) for v in values if str(v).strip() not in ("", "null", "None")]
+    except Exception as e:
+        print(f"  [_llm_extract_values error] {e}")
+    return None
+
+
+def compute_stat(operation: str, query: str, docs: list) -> str | None:
+    """
+    Run a deterministic statistical computation over retrieved table docs.
+
+    For each table doc:
+      1. Ask the LLM (as a reader) to extract the relevant float values.
+      2. If values found, run numpy/scipy math on them.
+      3. Return the answer string.
+      4. If no values found, try the next table. If all tables exhausted, return None.
+
+    The LLM is used ONLY for reading/extracting values — all math is Python.
+    """
+    print(f"  [compute_stat] operation={operation!r}, docs={len(docs)}")
+    for doc in docs:
+        if doc.metadata.get("type") != "table":
+            continue
+
+        raw_md = doc.metadata.get("raw_table_markdown", doc.page_content)
+        tbl_path = doc.metadata.get("table_path", "")
+
+        print(f"  [compute_stat] trying table: {tbl_path}")
+        values = _llm_extract_values(query, raw_md, operation)
+        print(f"  [compute_stat] extracted values: {values}")
+
+        if not values:
+            continue
+
+        citation = f"\n\n[Source Table: {tbl_path}]" if tbl_path else ""
+        vals = np.array(values, dtype=float)
+        n = len(vals)
+
+        if operation == "delta":
+            if n < 2:
+                continue
+            val_a, val_b = vals[0], vals[1]
+            delta = round(float(val_b - val_a), 4)
+            sign = "+" if delta >= 0 else ""
+            return (
+                f"Delta: {sign}{delta} "
+                f"({round(float(val_a), 4)} -> {round(float(val_b), 4)})"
+                f"{citation}"
+            )
+
+        if n == 0:
+            continue
+
+        if operation == "mean":
+            ans = round(float(np.mean(vals)), 4)
+            return f"Mean across {n} values: {ans}{citation}"
+
+        elif operation == "median":
+            ans = round(float(np.median(vals)), 4)
+            return f"Median across {n} values: {ans}{citation}"
+
+        elif operation == "mode":
+            try:
+                from scipy import stats as _scipy_stats
+                m = _scipy_stats.mode(vals, keepdims=False)
+                ans = round(float(m.mode), 4)
+            except Exception:
+                unique, counts = np.unique(vals, return_counts=True)
+                ans = round(float(unique[np.argmax(counts)]), 4)
+            return f"Mode across {n} values: {ans}{citation}"
+
+        elif operation == "range":
+            mn, mx = float(np.min(vals)), float(np.max(vals))
+            span = round(mx - mn, 4)
+            return (
+                f"Range: {span} "
+                f"(min={round(mn, 4)}, max={round(mx, 4)}) "
+                f"across {n} values{citation}"
+            )
+
+        elif operation == "std":
+            pop_std = round(float(np.std(vals, ddof=0)), 4)
+            samp_std = round(float(np.std(vals, ddof=1)) if n > 1 else 0.0, 4)
+            return (
+                f"Std dev across {n} values: "
+                f"{pop_std} (population) / {samp_std} (sample)"
+                f"{citation}"
+            )
+
+        elif operation == "percentile":
+            ans = round(float(np.percentile(vals, 90)), 4)
+            return f"90th percentile across {n} values: {ans}{citation}"
+
+        elif operation == "weighted_mean":
+            ans = round(float(np.mean(vals)), 4)
+            return f"Weighted mean across {n} values: {ans}{citation}"
+
+    print("  [compute_stat] no values found in any table — returning None")
+    return None
+
+
 def is_image_query(query: str) -> bool:
     q = query.lower()
+    # NOTE: "graph" and "plot" removed — these words previously forced image-mode
+    # routing but chart data no longer leaks into the table index (OCR fix).
+    # Queries about training graphs/plots now route through text-mode correctly.
     image_keywords = [
-        "figure", "fig", "diagram", "chart", "graph", "plot",
+        "figure", "fig", "diagram", "chart",
         "architecture", "workflow", "flow", "visual", "illustration"
     ]
     return any(term in q for term in image_keywords)
@@ -235,13 +416,16 @@ def rerank_docs(query: str, docs: list, top_n: int = 5) -> list:
 def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> list:
     mode = _query_mode(query)
 
-    fetch_k = 8 if source_filter is None else 12
+    fetch_k = 8 if source_filter is None else 40
     raw_docs = vectorstore.similarity_search(query, k=fetch_k)
 
     if source_filter:
         filtered = [d for d in raw_docs if _matches_source(d, source_filter)]
         if filtered:
             raw_docs = filtered
+        else:
+            # If the filter wiped out everything, don't fall back to returning wrong papers!
+            raw_docs = []
 
     raw_docs = _unique_docs(raw_docs)
 
@@ -250,15 +434,22 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
         seen_content = set()
 
         # --- HYBRID SEARCH: FAISS + BM25 ---
-        table_pool_k = 12 if source_filter is None else 16
-        faiss_table_docs = vectorstore.similarity_search(query, k=table_pool_k)
+        table_pool_k = 12 if source_filter is None else 60
+        faiss_raw = vectorstore.similarity_search(query, k=table_pool_k)
+        if source_filter:
+            faiss_table_docs = [d for d in faiss_raw if _matches_source(d, source_filter)]
+        else:
+            faiss_table_docs = faiss_raw
 
         bm25_docs = []
         if bm25_retriever is not None:
             # BM25 is excellent for exact keyword matches (e.g. "FUNSD F1").
-            # FIX #4: Apply source filter to BM25 results BEFORE interleaving
-            # so that irrelevant-paper tables don't consume context slots.
+            # Increase k to prevent post-filtering starvation
+            old_k = getattr(bm25_retriever, "k", 4)
+            bm25_retriever.k = 30
             bm25_raw = bm25_retriever.invoke(query)
+            bm25_retriever.k = old_k
+            
             if source_filter:
                 bm25_docs = [d for d in bm25_raw if _matches_source(d, source_filter)]
             else:
@@ -397,9 +588,24 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
     else:
         docs = retrieve(query, vectorstore, source_filter=source_filter)
 
+    # ── STATISTICAL COMPUTATION LAYER ────────────────────────────────────────
+    # Check BEFORE the pandas agent or LLM path. If the query asks for a
+    # statistical operation (mean, range, std, delta, etc.), compute it with
+    # Python (numpy) using values extracted by the LLM from the raw markdown.
+    stat_op = detect_stat_operation(query)
+    print(f"  [answer_query] stat_op detected: {stat_op!r}")
+    if stat_op is not None:
+        stat_answer = compute_stat(stat_op, query, docs)
+        if stat_answer is not None:
+            print(f"  [answer_query] stat layer returned answer, short-circuiting LLM.")
+            return stat_answer
+        print("  [answer_query] stat layer returned None — falling through to LLM.")
+    # ─────────────────────────────────────────────────────────────────────────
+
     formatted_contexts = []
     referenced_tables = []
     referenced_images = []
+
 
     for idx, doc in enumerate(docs):
         doc_type = doc.metadata.get("type", "text")
@@ -450,6 +656,9 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
     # FIX #11: Choose prompt based on whether the question is analytical.
     # 'hybrid' mode queries explicitly need discussion, not just cell lookups.
     _needs_discussion = (mode == "hybrid") or _is_analytical_query(query)
+    
+    q_lower = query.lower()
+    wants_table = any(w in q_lower for w in ["top", "list", "all", "table", "show", "best"])
 
     if mode in ("table", "hybrid") and not _needs_discussion:
         # PANDAS CODE-GEN AGENT (Program-Aided Language)
@@ -475,12 +684,19 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
                     agent_type="zero-shot-react-description",
                     max_iterations=4
                 )
-                answer = agent.invoke({"input": f"Answer in MAXIMUM ONE SENTENCE with the exact value or metric. Do not include any explanations or code. Query: {query}"})
+                if wants_table:
+                    agent_prompt = f"Answer the query based on the data. Return a clean MARKDOWN TABLE. Do not include any code or explanations. Query: {query}"
+                else:
+                    agent_prompt = f"Answer in MAXIMUM ONE SENTENCE with the exact value or metric. Do not include any explanations or code. Query: {query}"
+                
+                answer = agent.invoke({"input": agent_prompt})
                 answer_text = answer.get("output", str(answer))
                 
                 # BUG 2: Sanity check agent output
                 rejected = False
-                if "|" in answer_text or "(#:" in answer_text or "Agent stopped" in answer_text:
+                if "(#:" in answer_text or "Agent stopped" in answer_text:
+                    rejected = True
+                elif not wants_table and "|" in answer_text:
                     rejected = True
                 else:
                     # Extract words and numbers from answer
@@ -510,7 +726,22 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
                 print(f"Pandas Agent failed ({e}), falling back to standard LLM table lookup...")
                 
         # Pure lookup fallback prompt if agent failed or no valid DFS parsed
-        prompt = f"""You are a precise data analyst. Answer using ONLY the provided context in MAXIMUM ONE SENTENCE. Do not explain.
+        if wants_table:
+            prompt = f"""You are a precise data analyst. Answer using ONLY the provided context.
+        Return a clean MARKDOWN TABLE with the requested data. Do not explain.
+
+        Context:
+        {context}
+
+        Question: {query}
+
+        - Identify the correct table, rows and columns.
+        - Output a markdown table.
+        - If the value is not in the context, say "Not found in context".
+
+        Answer:"""
+        else:
+            prompt = f"""You are a precise data analyst. Answer using ONLY the provided context in MAXIMUM ONE SENTENCE. Do not explain.
 
         Context:
         {context}
