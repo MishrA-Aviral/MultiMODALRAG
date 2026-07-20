@@ -80,7 +80,7 @@ def run_pipeline(excel_path: str = "Queries.xlsx"):
             answers[sheet] = sheet_answers
             
             # Incremental save: write to Excel after every single query!
-            write_answers(excel_path, answers)
+            write_answers(excel_path, answers, all_queries)
             
             time.sleep(3)
 

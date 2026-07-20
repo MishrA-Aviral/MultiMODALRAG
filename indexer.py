@@ -84,16 +84,16 @@ def generate_table_summary(markdown_content: str, caption: str = "") -> str:
             api_key=api_key,
         )
 
-        caption_line = f'The table caption is: "{caption}".\n' if caption else ""
+        caption_line = f'The table caption or heading is: "{caption}".\n' if caption else ""
         prompt = (
-            f"You are a research paper analyst. {caption_line}"
-            f"Below is a markdown table extracted from an academic paper.\n\n"
+            f"You are a precise data analyst. {caption_line}"
+            f"Below is a markdown table.\n\n"
             f"{markdown_content}\n\n"
             f"Write a single dense prose paragraph (max 5 sentences) that captures:\n"
-            f"- The main benchmark, task, or topic being evaluated.\n"
-            f"- Every model name, architecture, or approach listed in the rows or columns.\n"
-            f"- The exact names of all evaluation metrics (e.g. F1, accuracy, mAP, BLEU).\n"
-            f"- Any notably high or low values worth calling out.\n"
+            f"- The main topic or subject of the table (e.g. financial results, model performance, schedule).\n"
+            f"- Every row label, entity name, metric, or line item listed.\n"
+            f"- The exact column headers (e.g. years, quarters, model names, metric names).\n"
+            f"- Any notably high, low, or significant values worth calling out.\n"
             f"Do NOT use bullet points. Output only the prose paragraph."
         )
 

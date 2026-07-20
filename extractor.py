@@ -45,6 +45,110 @@ _pp_engine = None
 _pp_engine_type = None   # "paddlex" | "ppstructure" | "none"
 
 
+# ─── Financial document support ────────────────────────────────────────────────
+# Tier-1 label regex: matches explicit prefixes used in academic papers *and*
+# financial reports (Table 3, Schedule A, Exhibit 99.1, Appendix B …)
+_TABLE_LABEL_RE = re.compile(
+    r'^\s*(Table|Tbl\.?|Schedule|Exhibit|Appendix)\s+[\dA-Z][\w\.]*[:\.[\s]',
+    re.IGNORECASE,
+)
+
+# Tier-2 regex: matches known financial section-heading keywords.
+# No explicit "Table N" prefix needed — the keyword alone is sufficient.
+_FINANCIAL_TABLE_HEADING_RE = re.compile(
+    r'balance\s+sheet'
+    r'|income\s+statement'
+    r'|statement[s]?\s+of\s+(cash\s+flows?|operations?|earnings?|equity|changes)'
+    r'|profit\s+(?:and|&)\s+loss'
+    r'|p\s*(?:&|and)\s*l\b'
+    r'|cash\s+flow'
+    r'|financial\s+(?:results?|highlights?|summary|position|data|statements?)'
+    r'|shareholders?\s+(?:equity|funds?)'
+    r'|earnings?\s+(?:per\s+share|release)'
+    r'|consolidated\s+(?:statements?|results?|financials?|balance|income)'
+    r'|notes?\s+to\s+(?:the\s+)?(?:consolidated\s+)?financial\s+statements?'
+    r'|segment\s+(?:results?|information|data)'
+    r'|selected\s+financial\s+(?:data|information)'
+    r'|quarterly\s+(?:results?|data|financials?)'
+    r'|operating\s+(?:results?|data|summary)'
+    r'|schedule\s+of'
+    r'|five[- ]year\s+(?:summary|financial)'
+    r'|revenue\s+(?:summary|breakdown|by\s+segment)'
+    r'|return\s+on\s+(?:equity|assets|investment|capital)'
+    r'|key\s+(?:financial|performance)\s+(?:metrics?|indicators?|data|highlights?)'
+    r'|ageing\s+schedule'
+    r'|property,\s+plant\s+(?:and|&)\s+equipment'
+    r'|tangible\s+assets'
+    r'|as\s+follows\b',
+    re.IGNORECASE,
+)
+
+# Extended figure/chart label regex: academic "Figure N" + financial "Chart/Exhibit N".
+_FIGURE_LABEL_RE = re.compile(
+    r'^\s*(Figure|Fig\.?|Chart|Graph|Diagram|Exhibit|Illustration|Graphic)\s+[\dA-Z][\w\.]*[:\.\-\s]',
+    re.IGNORECASE,
+)
+
+# Financial chart caption keywords — detect unlabelled chart/graph captions.
+_FINANCIAL_CHART_CAPTION_RE = re.compile(
+    r'revenue|margin|ebitda|earnings|profit(?:\s|$)|loss(?:\s|$)'
+    r'|growth|trend|performance|sales|cash\s+flow|net\s+income'
+    r'|operating\s+(?:income|profit|margin)|segment|return\s+on'
+    r'|market\s+share|year[- ]over[- ]year|quarter(?:ly)?|annual(?:ized)?',
+    re.IGNORECASE,
+)
+
+# Compiled patterns for the _looks_financial() guard in _is_chart_artifact().
+_FINANCIAL_YEAR_RE   = re.compile(r'^(19|20)\d{2}$')
+_FINANCIAL_AMOUNT_RE = re.compile(r'^[\(\$£€¥₹]?[\d,]+\.?\d*[KMBkmb]?\)?%?$')
+
+
+def _sentence_boundaries(text: str) -> int:
+    """Count mid-text sentence boundaries (period/!/? followed by whitespace + uppercase)."""
+    return len(re.findall(r'(?<=[.!?])\s+[A-Z]', text))
+
+
+def _is_table_heading(text: str) -> bool:
+    """
+    Return True if *text* looks like a table heading rather than body prose.
+
+    Two-tier detection (works for both academic and financial documents):
+      Tier 1 — explicit label prefix:  "Table 3:", "Schedule A.", "Exhibit 99.1"
+      Tier 2 — known financial heading keyword (e.g. "Balance Sheet",
+               "Statement of Cash Flows", "Income Statement")
+
+    Sentence-count guard: blocks spanning 3+ sentences (i.e. containing more
+    than 1 mid-text sentence boundary) are treated as body prose and rejected.
+    """
+    text = text.strip()
+    if not text:
+        return False
+    if _TABLE_LABEL_RE.match(text):
+        return True
+        
+    # Reject body paragraphs that happen to contain financial keywords.
+    # True financial headings are usually noun phrases (no period) or end with a colon.
+    # If it ends with a period, it's almost certainly a prose sentence (e.g. footnotes).
+    if text.endswith('.') and not re.search(r'as\s+follows', text, re.IGNORECASE):
+        return False
+
+    if _sentence_boundaries(text) > 1:
+        return False
+    return bool(_FINANCIAL_TABLE_HEADING_RE.search(text))
+
+
+def _is_financial_chart_caption(text: str) -> bool:
+    """
+    Return True if *text* looks like an unlabelled financial chart/graph caption
+    (a short block — ≤ 2 sentences — that contains financial visualisation keywords).
+    """
+    text = text.strip()
+    if not text or _sentence_boundaries(text) > 1:
+        return False
+    return bool(_FINANCIAL_CHART_CAPTION_RE.search(text))
+
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Section 1: Low-level cell helpers  (unchanged from original)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -325,6 +429,21 @@ def html_table_to_markdown(html_str: str) -> str:
 # Section 4: Chart-artifact rejection heuristics
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _looks_financial(values: list) -> bool:
+    """
+    Return True if *values* look like years or monetary amounts rather than
+    bare integer Y-axis tick marks.  Used to exempt financial table columns
+    from the chart-artifact integer heuristic in _is_chart_artifact().
+    """
+    if not values:
+        return False
+    hits = sum(
+        1 for v in values
+        if _FINANCIAL_YEAR_RE.match(v) or _FINANCIAL_AMOUNT_RE.match(v)
+    )
+    return hits / len(values) > 0.5
+
+
 def _is_chart_artifact(grid: list) -> bool:
     """
     Return True if the extracted region looks like chart axis data or a
@@ -353,8 +472,9 @@ def _is_chart_artifact(grid: list) -> bool:
     # IMPORTANT: only applied when the table is very narrow (≤2 columns).
     # Wide tables (e.g. architecture / CIFAR-10 comparison tables) legitimately
     # have integer-only first columns (n=3,5,7,9…) and must NOT be rejected.
+    # EXEMPT: financial tables where column-0 values are years or monetary amounts.
     col0 = [row[0].strip() for row in grid if row and row[0].strip()]
-    if col0 and num_cols <= 2:
+    if col0 and num_cols <= 2 and not _looks_financial(col0):
         int_frac = sum(1 for v in col0 if re.match(r'^\d{1,3}$', v)) / len(col0)
         if int_frac > 0.5:
             return True
@@ -579,19 +699,22 @@ def extract_tables(pdf_path: str,
 
     for i, fitz_page in enumerate(doc_fitz):
 
-            # ── 1. Collect table captions from fitz text blocks ───────────────
+            # ── 1. Collect table headings from fitz text blocks ─────────────────
+            # _is_table_heading() handles both academic captions ("Table 3:") and
+            # financial section headings ("Balance Sheet", "Statement of Cash Flows",
+            # "Exhibit 99.1", etc.) via a two-tier regex + sentence-count guard.
             blocks = fitz_page.get_text("blocks")
             tbl_captions = []
             for b in blocks:
                 b_text = b[4].strip()
-                if re.match(r'^\s*(Table)\s+\d+[:\.\s]', b_text, re.IGNORECASE):
+                if _is_table_heading(b_text):
                     tbl_captions.append({
                         "text": b_text,
                         "bbox": (b[0], b[1], b[2], b[3])
                     })
 
             if not tbl_captions:
-                continue    # No table captions → skip page
+                continue    # No table headings found → skip page
 
             # ── 2 & 3. Run TATR table detection on the fitz page ──────────────
             tatr_tables = _extract_tatr_tables_on_page(fitz_page, _RENDER_SCALE)
@@ -817,11 +940,13 @@ def extract_images(pdf_path: str,
         page_num = i + 1
 
         # ── 1. Figure captions on this page ───────────────────────────────────
+        # Tier 1: explicit label  (Figure N, Chart N, Graph N, Exhibit N, …)
+        # Tier 2: unlabelled financial chart captions (short blocks with finance keywords)
         blocks      = page.get_text("blocks")
         fig_captions = []
         for b in blocks:
             b_text = b[4].strip()
-            if re.match(r'^\s*(Figure|Fig)\s+\d+[:\.]', b_text, re.IGNORECASE):
+            if _FIGURE_LABEL_RE.match(b_text) or _is_financial_chart_caption(b_text):
                 fig_captions.append({
                     "text": b_text,
                     "bbox": fitz.Rect(b[0], b[1], b[2], b[3])

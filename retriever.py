@@ -16,6 +16,21 @@ from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe
 
 bm25_retriever = None
 
+# Registry built at index-load time: source_basename → list of sample text chunks.
+# Populated by load_index(); used by _auto_detect_source() to route queries
+# to the right document without any manual source-filter configuration.
+_source_registry: dict = {}
+
+# Phrases that indicate the LLM did not find the requested data.
+# Citation tags must not be appended when the answer signals failure.
+_FAILURE_PHRASES = (
+    "not found in context",
+    "not directly provided",
+    "cannot",
+    "unable to",
+    "no explicit",
+)
+
 load_dotenv()
 
 embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
@@ -31,13 +46,31 @@ llm = ChatGroq(
 )
 
 def load_index(faiss_path: str = "db/faiss_index"):
-    global bm25_retriever
+    global bm25_retriever, _source_registry
     bm25_path = "db/bm25_tables.pkl"
     if os.path.exists(bm25_path):
         with open(bm25_path, "rb") as f:
             bm25_retriever = pickle.load(f)
-            
-    return FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
+
+    vs = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
+
+    # Build source registry: collect up to 3 representative text chunks per
+    # indexed source so the LLM can recognise which document a query refers to.
+    _source_registry = {}
+    for doc_id, doc in vs.docstore._dict.items():
+        src = doc.metadata.get("source", "")
+        if not src:
+            continue
+        if src not in _source_registry:
+            _source_registry[src] = []
+        if len(_source_registry[src]) < 3:
+            chunk = doc.page_content.strip()[:300]
+            if chunk:
+                _source_registry[src].append(chunk)
+
+    print(f"  [load_index] {len(_source_registry)} source(s) registered: "
+          f"{list(_source_registry.keys())}")
+    return vs
 
 
 def _normalize_row(row: str) -> str:
@@ -305,61 +338,37 @@ def compute_stat(operation: str, query: str, docs: list) -> str | None:
     return None
 
 
-def is_image_query(query: str) -> bool:
-    q = query.lower()
-    # NOTE: "graph" and "plot" removed — these words previously forced image-mode
-    # routing but chart data no longer leaks into the table index (OCR fix).
-    # Queries about training graphs/plots now route through text-mode correctly.
-    image_keywords = [
-        "figure", "fig", "diagram", "chart",
-        "architecture", "workflow", "flow", "visual", "illustration"
-    ]
-    return any(term in q for term in image_keywords)
-
-
-def is_table_query(query: str) -> bool:
-    q = query.lower()
-    table_keywords = [
-        "table", "benchmark", "comparison", "compare", "compared",
-        "highest", "lowest", "best", "worst", "gain", "improvement",
-        "difference", "increase", "decrease", "rank", "ranking",
-        "average", "score", "accuracy", "f1", "map", "parameter",
-        "ablation", "which category", "which model", "which approach"
-    ]
-    return any(term in q for term in table_keywords)
-
-
-# Keywords that strongly signal the user wants a textual discussion/explanation
-_ANALYTICAL_KEYWORDS = [
-    "discuss", "explain", "why", "how does", "tradeoff", "trade-off",
-    "reason", "suggest", "imply", "what does this", "elaborate",
-    "describe", "what is the", "what are the", "relationship"
-]
-
-
-def _is_analytical_query(query: str) -> bool:
-    """Return True if the query asks for explanation/discussion, not just a lookup."""
-    q = query.lower()
-    return any(term in q for term in _ANALYTICAL_KEYWORDS)
-
-
-def _query_mode(query: str) -> str:
-    """
-    Return one of: 'hybrid', 'table', 'image', 'text'.
-
-    'hybrid' is used when the query has table-related keywords but ALSO asks
-    for discussion/explanation — meaning the LLM needs both table data AND
-    surrounding prose to give a complete answer.
-    """
-    if is_image_query(query):
-        return "image"
-    if is_table_query(query):
-        # If the query also wants analysis/discussion, use hybrid mode so
-        # text context is always included alongside the tables.
-        if _is_analytical_query(query):
-            return "hybrid"
-        return "table"
-    return "text"
+def _llm_classify_query(query: str) -> dict:
+    """Use the LLM to classify the query routing intent."""
+    prompt = (
+        f"Analyze the following user query and return a valid JSON object with EXACTLY these four boolean keys:\n"
+        f'  "wants_table_data": true if the query asks for numbers, metrics, comparisons, benchmarks, '
+        f'financial figures (revenue, profit, EPS, ratios, balance sheet items), or any data typically '
+        f'presented in tabular form.\n'
+        f'  "wants_image_data": true if the query asks about charts, graphs, figures, diagrams, '
+        f'or any visual content.\n'
+        f'  "needs_analysis": true if the query asks for explanations, reasons, trends, tradeoffs, '
+        f'or interpretation (why/how) rather than just a fact lookup.\n'
+        f'  "format_as_table": true if the query asks for a ranked list, comparison table, '
+        f'or explicitly requests tabular output.\n\n'
+        f'Query: "{query}"\n\n'
+        f"Return ONLY JSON. No explanations."
+    )
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"  [LLM Router Error] {e}")
+        # Safe fallback
+        return {
+            "wants_table_data": True,
+            "wants_image_data": False,
+            "needs_analysis": False,
+            "format_as_table": False
+        }
 
 
 def _matches_source(doc, source_filter: str) -> bool:
@@ -413,10 +422,15 @@ def rerank_docs(query: str, docs: list, top_n: int = 5) -> list:
 
     return [doc for score, doc in ranked[:top_n]]
 
-def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> list:
-    mode = _query_mode(query)
+def retrieve(query: str, vectorstore, intent: dict, k: int = 6, source_filter: str = None) -> list:
+    if intent.get("wants_image_data"):
+        mode = "image"
+    elif intent.get("wants_table_data"):
+        mode = "hybrid" if intent.get("needs_analysis") else "table"
+    else:
+        mode = "text"
 
-    fetch_k = 8 if source_filter is None else 40
+    fetch_k = 40 if source_filter is None else 8
     raw_docs = vectorstore.similarity_search(query, k=fetch_k)
 
     if source_filter:
@@ -434,7 +448,7 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
         seen_content = set()
 
         # --- HYBRID SEARCH: FAISS + BM25 ---
-        table_pool_k = 12 if source_filter is None else 60
+        table_pool_k = 60 if source_filter is None else 12
         faiss_raw = vectorstore.similarity_search(query, k=table_pool_k)
         if source_filter:
             faiss_table_docs = [d for d in faiss_raw if _matches_source(d, source_filter)]
@@ -492,7 +506,7 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
             seen_content.add(content)
             seen_raw_markdown.add(raw_md)
 
-            if len(table_docs) >= 4:
+            if len(table_docs) >= 15:
                 break
 
         if not table_docs:
@@ -512,7 +526,7 @@ def retrieve(query: str, vectorstore, k: int = 6, source_filter: str = None) -> 
         # Analytical and hybrid queries still reserve prose for explanation.
         if mode == "hybrid":
             text_slots = 2
-        elif _is_analytical_query(query):
+        elif intent.get("needs_analysis"):
             text_slots = 1
         else:
             text_slots = 0  # pure lookup — give every slot to tables
@@ -576,17 +590,85 @@ def _invoke_llm_with_retry(prompt: str, retries: int = 3, base_sleep: int = 6):
     raise RuntimeError("LLM invocation failed.")
 
 
+def _auto_detect_source(query: str) -> str | None:
+    """
+    Use the LLM to determine which indexed source the query is about.
+
+    The _source_registry (built at load_index() time) provides a name and
+    sample text for every indexed document. The LLM reads these and picks
+    the best match — or returns None for cross-document / ambiguous queries.
+
+    Short-circuit cases (no LLM call):
+      - 0 sources registered        → None (nothing to filter by)
+      - Exactly 1 source registered → always that source
+    """
+    if not _source_registry:
+        return None
+    if len(_source_registry) == 1:
+        return list(_source_registry.keys())[0]
+
+    # Build one description block per source
+    blocks = []
+    for src, samples in _source_registry.items():
+        preview = " | ".join(s[:200] for s in samples[:2])
+        blocks.append(f'- "{src}"\n  Content preview: {preview}')
+    sources_section = "\n".join(blocks)
+
+    prompt = (
+        f"You are a document routing assistant. The following documents are indexed:\n\n"
+        f"{sources_section}\n\n"
+        f'User query: "{query}"\n\n'
+        f"Which document should be searched to answer this query?\n"
+        f"Rules:\n"
+        f'- If the query clearly refers to ONE document, return: {{"source": "exact_filename.pdf"}}\n'
+        f'- If the query spans multiple documents or is ambiguous, return: {{"source": null}}\n'
+        f"Return ONLY valid JSON. No explanation."
+    )
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw = response.content.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        result = json.loads(raw)
+        detected = result.get("source")
+        # Only trust the result if it exactly matches a known source
+        if detected and detected in _source_registry:
+            return detected
+        return None
+    except Exception as e:
+        print(f"  [_auto_detect_source error] {e}")
+        return None
+
 def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
+    # Auto-detect which document(s) this query is about when the caller
+    # does not provide an explicit source filter (the normal case).
+    # For cross-document queries the LLM returns null → source_filter stays None
+    # and retrieval searches across all indexed documents.
+    if source_filter is None:
+        source_filter = _auto_detect_source(query)
+        if source_filter:
+            print(f"  [auto-detect] query routed to: {source_filter!r}")
+        else:
+            print(f"  [auto-detect] cross-document or ambiguous — searching all sources")
+
     page_match = re.search(r'page\s+(\d+)', query, re.IGNORECASE)
-    mode = _query_mode(query)
+    
+    intent = _llm_classify_query(query)
+    
+    if intent.get("wants_image_data"):
+        mode = "image"
+    elif intent.get("wants_table_data"):
+        mode = "hybrid" if intent.get("needs_analysis") else "table"
+    else:
+        mode = "text"
 
     if page_match:
         page_num = int(page_match.group(1))
         docs = get_page_docs(vectorstore, page_num, source_filter=source_filter)
         if not docs:
-            docs = retrieve(query, vectorstore, source_filter=source_filter)
+            docs = retrieve(query, vectorstore, intent, source_filter=source_filter)
     else:
-        docs = retrieve(query, vectorstore, source_filter=source_filter)
+        docs = retrieve(query, vectorstore, intent, source_filter=source_filter)
 
     # ── STATISTICAL COMPUTATION LAYER ────────────────────────────────────────
     # Check BEFORE the pandas agent or LLM path. If the query asks for a
@@ -645,7 +727,7 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
 
     # FIX #5: Truncate between document blocks, not mid-string.
     # This prevents the LLM from receiving a half-cut markdown table row.
-    MAX_CONTEXT_CHARS = 9000 if mode in ("table", "hybrid") else 6500
+    MAX_CONTEXT_CHARS = 12000 if mode in ("table", "hybrid") else 6500
     if len(context) > MAX_CONTEXT_CHARS:
         # Walk backwards from the char limit to find the nearest block boundary
         cutoff = context.rfind("\n\n", 0, MAX_CONTEXT_CHARS)
@@ -655,10 +737,9 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
 
     # FIX #11: Choose prompt based on whether the question is analytical.
     # 'hybrid' mode queries explicitly need discussion, not just cell lookups.
-    _needs_discussion = (mode == "hybrid") or _is_analytical_query(query)
+    _needs_discussion = (mode == "hybrid") or intent.get("needs_analysis")
     
-    q_lower = query.lower()
-    wants_table = any(w in q_lower for w in ["top", "list", "all", "table", "show", "best"])
+    wants_table = intent.get("format_as_table")
 
     if mode in ("table", "hybrid") and not _needs_discussion:
         # PANDAS CODE-GEN AGENT (Program-Aided Language)
@@ -715,8 +796,9 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
                             rejected = True
                 
                 if not rejected:
-                    if "[Source Table:" not in answer_text and referenced_tables:
-                        answer_text += f"\n\n[Source Table: {referenced_tables[0]}]"
+                    if not any(p in answer_text.lower() for p in _FAILURE_PHRASES):
+                        if "[Source Table:" not in answer_text and referenced_tables:
+                            answer_text += f"\n\n[Source Table: {referenced_tables[0]}]"
                     return answer_text
                 else:
                     print("Pandas Agent returned invalid output or stopped, falling back to standard LLM table lookup...")
@@ -804,10 +886,11 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
     response = _invoke_llm_with_retry(prompt)
     answer = response.content.strip()
 
-    if "[Source Table:" not in answer and referenced_tables:
-        answer += f"\n\n[Source Table: {referenced_tables[0]}]"
-    if "[Source Image:" not in answer and referenced_images:
-        answer += f"\n\n[Source Image: {referenced_images[0]}]"
+    if not any(p in answer.lower() for p in _FAILURE_PHRASES):
+        if "[Source Table:" not in answer and referenced_tables:
+            answer += f"\n\n[Source Table: {referenced_tables[0]}]"
+        if "[Source Image:" not in answer and referenced_images:
+            answer += f"\n\n[Source Image: {referenced_images[0]}]"
 
     return answer
 
