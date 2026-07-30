@@ -14,6 +14,7 @@ returns no results.
 """
 
 import base64
+import hashlib
 import time
 import fitz
 import pdfplumber
@@ -21,6 +22,8 @@ import sqlite3
 import os
 import re
 import tempfile
+import torch
+import gc
 
 import numpy as np
 from PIL import Image
@@ -695,7 +698,34 @@ def extract_tables(pdf_path: str,
     os.makedirs(output_dir, exist_ok=True)
     table_records = []
 
+    # ── Set up SQLite DB for incremental writing ──────────────────────────────
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    conn   = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tables (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            source      TEXT,
+            page        INTEGER,
+            content     TEXT,
+            caption     TEXT,
+            table_path  TEXT,
+            table_group_id TEXT
+        )
+    """)
+    cursor.execute("DELETE FROM tables WHERE source = ?",
+                   (os.path.basename(pdf_path),))
+
     doc_fitz = fitz.open(pdf_path)
+
+    # ── Continuation tracking for multi-page tables ───────────────────────────
+    # Many financial schedules (e.g. "Details of Subsidiaries") span dozens of
+    # pages.  Only the first page carries a heading; subsequent pages have no
+    # caption within 150pt.  We track the last matched caption and its table's
+    # horizontal x-range so we can extend it to continuation pages.
+    _last_table_caption: str | None = None
+    _last_table_x_range: tuple | None = None  # (x0, x1)
+    _pages_since_last_table: int = 0  # consecutive candidate-less pages since last match
 
     for i, fitz_page in enumerate(doc_fitz):
 
@@ -713,8 +743,8 @@ def extract_tables(pdf_path: str,
                         "bbox": (b[0], b[1], b[2], b[3])
                     })
 
-            if not tbl_captions:
-                continue    # No table headings found → skip page
+            # STRICT GUARD REMOVED: TATR now evaluates all pages to prevent
+            # missing critical unlabelled financial tables.
 
             # ── 2 & 3. Run TATR table detection on the fitz page ──────────────
             tatr_tables = _extract_tatr_tables_on_page(fitz_page, _RENDER_SCALE)
@@ -744,22 +774,13 @@ def extract_tables(pdf_path: str,
                 markdown = cand["markdown"]
                 grid     = cand["grid"]
 
-                # Reject chart axis artifacts
-                if _is_chart_artifact(grid):
-                    print(f"  [OCR] p.{i+1}: skipping chart artifact from {cand.get('source')}")
-                    continue
-
-                # Reject suspiciously sparse regions
-                nonempty_cells = [
-                    c for row in grid for c in row
-                    if isinstance(c, str) and c.strip()
-                ]
-                if len(nonempty_cells) < 4:
-                    continue
-
                 tbl_x0, tbl_y0, tbl_x1, tbl_y1 = bbox
 
-                # ── Caption matching ──────────────────────
+                # ── Caption matching (FIRST — before any heuristic filter) ────────
+                # Caption/continuation signal is authoritative: a candidate that has
+                # a matched caption or horizontal continuation is never rejected by
+                # the chart-artifact or sparse heuristics, which were designed for
+                # unlabelled OCR noise, not captioned financial table rows.
                 best_cap = None
                 min_dist = float("inf")
 
@@ -793,16 +814,57 @@ def extract_tables(pdf_path: str,
                             min_dist = dist
                             best_cap = cap["text"]
 
-                if not best_cap or min_dist > 150:
+                has_direct_caption = best_cap is not None and min_dist <= 150
+
+                # ── Continuation fallback for multi-page tables ───────────────────
+                used_continuation = False
+                if not has_direct_caption:
+                    if _last_table_caption and _last_table_x_range:
+                        prev_x0, prev_x1 = _last_table_x_range
+                        if (abs(tbl_x0 - prev_x0) <= 20 and
+                                abs(tbl_x1 - prev_x1) <= 20):
+                            best_cap = _last_table_caption
+                            min_dist = 0
+                            used_continuation = True
+                            # print(f"  [DEBUG p.{i+1}] ACCEPTED via continuation, caption={best_cap!r}")
+
+                # ── Heuristic filters — ONLY for orphan candidates ────────────────
+                # Captioned or continuation-matched candidates bypass these entirely.
+                if not has_direct_caption and not used_continuation:
+                    if _is_chart_artifact(grid):
+                        # print(f"  [OCR] p.{i+1}: skipping chart artifact from {cand.get('source')}")
+                        # print(f"  [DEBUG p.{i+1}] REJECTED: chart_artifact")
+                        continue
+                    nonempty_cells = [
+                        c for row in grid for c in row
+                        if isinstance(c, str) and c.strip()
+                    ]
+                    if len(nonempty_cells) < 4:
+                        # print(f"  [DEBUG p.{i+1}] REJECTED: sparse ({len(nonempty_cells)} cells)")
+                        continue
+                    # Orphan: not a chart artifact, not sparse, but still no caption —
+                    # discard; we don't accept unlabelled tables.
+                    # print(f"  [DEBUG p.{i+1}] REJECTED: no caption/continuation match")
                     continue
 
                 # Deduplicate: Keep only the closest table candidate per caption
                 if best_cap not in caption_matches or min_dist < caption_matches[best_cap][0]:
-                    caption_matches[best_cap] = (min_dist, cand)
+                    if has_direct_caption:
+                        group_id = hashlib.md5(f"{best_cap}_{i+1}".encode()).hexdigest()[:8]
+                    elif used_continuation:
+                        group_id = _last_table_group_id
+                    else:
+                        group_id = None
+                    caption_matches[best_cap] = (min_dist, cand, group_id)
+                    # Update continuation tracking with this page's match
+                    _last_table_caption = best_cap
+                    _last_table_x_range = (tbl_x0, tbl_x1)
+                    _last_table_group_id = group_id
+                    _pages_since_last_table = 0  # successful match resets the gap counter
 
             # ── Write markdown files for the unique matched tables ────────
             page_count = 0
-            for best_cap, (dist, cand) in caption_matches.items():
+            for best_cap, (dist, cand, group_id) in caption_matches.items():
                 page_count += 1
                 filename = (
                     f"{os.path.basename(pdf_path)}"
@@ -812,75 +874,65 @@ def extract_tables(pdf_path: str,
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(cand["markdown"])
 
-                table_records.append({
+                record = {
                     "source":     os.path.basename(pdf_path),
                     "page":       i + 1,
                     "table_path": filepath,
                     "content":    cand["markdown"],
                     "caption":    best_cap,
-                    "bbox":       cand["bbox"]
-                })
+                    "bbox":       cand["bbox"],
+                    "table_group_id": group_id
+                }
+                table_records.append(record)
+
+                # Incremental SQLite write for memory streaming
+                cursor.execute(
+                    "INSERT INTO tables (source, page, content, caption, table_path, table_group_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (record["source"], record["page"], record["content"], 
+                     record["caption"], record["table_path"], record["table_group_id"])
+                )
+
+            conn.commit()
+
+            # Continuation reset — tolerate up to 2 consecutive candidate-less pages
+            # before giving up on a multi-page schedule (a section-break or header-only
+            # page in the middle of a 20-page schedule should not kill the whole chain).
+            if not candidates:
+                _pages_since_last_table += 1
+                if _pages_since_last_table > 2:
+                    # print(f"  [DEBUG p.{i+1}] continuation chain RESET (no candidates on this page)")
+                    _last_table_caption = None
+                    _last_table_x_range = None
+                    _last_table_group_id = None
+                    _pages_since_last_table = 0
+
+            # ── Free PyTorch memory for massive PDFs ───────────────────────────
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            gc.collect()
 
     doc_fitz.close()
-
-    # ── 6. Deduplicate by (page, caption) to remove phantom duplicates ────────
-    seen_keys   = {}
-    deduped     = []
-    for r in table_records:
-        # Use (page, first 120 chars of caption) as the dedup key.
-        # Two records with the same page + caption are the same logical table.
-        key = (r["page"], (r["caption"] or "").strip()[:120])
-        if key not in seen_keys:
-            seen_keys[key] = True
-            deduped.append(r)
-        else:
-            try:
-                os.remove(r["table_path"])
-            except OSError:
-                pass
-    table_records = deduped
-
-    # ── 7. Write to SQLite (same schema as before) ────────────────────────────
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn   = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tables (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            source      TEXT,
-            page        INTEGER,
-            content     TEXT,
-            caption     TEXT,
-            table_path  TEXT
-        )
-    """)
-    cursor.execute("DELETE FROM tables WHERE source = ?",
-                   (os.path.basename(pdf_path),))
-    for r in table_records:
-        cursor.execute(
-            "INSERT INTO tables (source, page, content, caption, table_path)"
-            " VALUES (?, ?, ?, ?, ?)",
-            (r["source"], r["page"], r["content"], r["caption"], r["table_path"])
-        )
-    conn.commit()
     conn.close()
 
     return table_records
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Section 8: Image extraction  (extract_images + _describe_image_with_vision)
+# Section 8: Image extraction  (extract_images + _describe_image_with_ocr)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _describe_image_with_vision(filepath: str, fallback_caption: str) -> str:
+def _describe_image_with_ocr(filepath: str, fallback_caption: str) -> str:
     """
-    Use PaddleOCR to extract all text visible inside an image (figure/chart from
-    a research paper) and combine it with the surrounding caption text so the
-    FAISS index receives rich, searchable content about each figure.
+    Extract text embedded inside an image using PaddleOCR and combine it with
+    the surrounding figure caption.
 
-    This is a fully local, lightweight operation — no vision LLM, no API key,
-    no GPU required. PaddleOCR reads axis labels, legend entries, numerical
-    values, and any other text embedded in the image.
+    This function ONLY reads text that is physically printed inside the image
+    (axis labels, legend text, numerical values, annotations).  It does NOT
+    produce any visual description — colors, icon shapes, chart types, spatial
+    layout, and similar visual properties are completely outside what this
+    function can provide.  The caller must not expect or advertise Vision
+    Descriptions; the output is strictly caption + OCR-extracted text.
 
     Falls back to the original fallback_caption silently on any error.
     """
@@ -914,6 +966,66 @@ def _describe_image_with_vision(filepath: str, fallback_caption: str) -> str:
     except Exception:
         return fallback_caption
 
+_VALID_CAPTION_TERMS = ["figure", "fig", "chart", "graph", "diagram", "trend", 
+                        "growth", "performance", "revenue", "financial", 
+                        "earnings", "results", "comparison", "analysis"]
+
+def _validate_image_candidate(img_bytes: bytes, candidate_type: str, filename: str, caption: str, seen_hashes: set, stats: dict) -> bool:
+    import io
+    import hashlib
+    import numpy as np
+    from PIL import Image
+    
+    stats["total"] += 1
+    
+    try:
+        img_obj = Image.open(io.BytesIO(img_bytes))
+        w_img, h_img = img_obj.size
+        min_size = 200 if candidate_type == "vector" else 150
+        
+        if w_img < min_size or h_img < min_size:
+            print(f"Rejected image:\n{filename}\nreason: too small")
+            stats["rejected_too_small"] += 1
+            return False
+            
+        if w_img / h_img > 5.0 or h_img / w_img > 5.0:
+            print(f"Rejected image:\n{filename}\nreason: extreme aspect ratio")
+            stats["rejected_aspect_ratio"] += 1
+            return False
+            
+        img_gray = img_obj.convert("L")
+        arr = np.array(img_gray)
+        if np.var(arr) < 50:
+            print(f"Rejected image:\n{filename}\nreason: low variance")
+            stats["rejected_low_variance"] += 1
+            return False
+            
+        img_hash = hashlib.md5(img_bytes).hexdigest()
+        if img_hash in seen_hashes:
+            print(f"Rejected image:\n{filename}\nreason: duplicate")
+            stats["rejected_duplicate"] += 1
+            return False
+            
+        has_meaningful_caption = False
+        if caption:
+            has_meaningful_caption = any(term in caption.lower() for term in _VALID_CAPTION_TERMS)
+            
+        if not has_meaningful_caption:
+            if w_img < 400 or h_img < 300:
+                print(f"Rejected image:\n{filename}\nreason: weak caption and not large enough ({w_img}x{h_img})")
+                stats["rejected_too_small"] += 1
+                return False
+            else:
+                stats["weak_caption_accepted"] += 1
+                
+        seen_hashes.add(img_hash)
+        stats["accepted"] += 1
+        return True
+    except Exception as e:
+        print(f"Error filtering {candidate_type} image: {e}")
+        stats["accepted"] += 1
+        return True
+
 
 def extract_images(pdf_path: str,
                    output_dir: str = "data/extracted_images",
@@ -929,6 +1041,16 @@ def extract_images(pdf_path: str,
     os.makedirs(output_dir, exist_ok=True)
     doc          = fitz.open(pdf_path)
     image_records = []
+    seen_image_hashes = set()
+    stats = {
+        "total": 0,
+        "accepted": 0,
+        "rejected_too_small": 0,
+        "rejected_aspect_ratio": 0,
+        "rejected_low_variance": 0,
+        "rejected_duplicate": 0,
+        "weak_caption_accepted": 0
+    }
 
     # Build per-page table bbox lookup (PDF point coordinates)
     table_bboxes_by_page = {}
@@ -952,9 +1074,10 @@ def extract_images(pdf_path: str,
                     "bbox": fitz.Rect(b[0], b[1], b[2], b[3])
                 })
 
-        # ── 2. Raster images ──────────────────────────────────────────────────
+        # ── 2. Raster images (photos, pre-rendered charts) ────────────────────
         images_info  = page.get_image_info(xrefs=True)
         seen_xrefs   = set()
+        consumed_captions = set()
         raster_images = []
         for img in images_info:
             xref = img.get("xref")
@@ -1005,13 +1128,20 @@ def extract_images(pdf_path: str,
                             min_dist = dist
                             best_cap = cap["text"]
 
+                if best_cap:
+                    consumed_captions.add(best_cap)
+
                 filename = f"{os.path.basename(pdf_path)}_page{page_num}_img_{xref}.{ext}"
+                
+                if not _validate_image_candidate(img_bytes, "raster", filename, best_cap, seen_image_hashes, stats):
+                    continue
+                    
                 filepath = os.path.join(output_dir, filename)
                 with open(filepath, "wb") as f:
                     f.write(img_bytes)
 
                 raw_caption     = best_cap if best_cap else f"Figure on page {page_num} of {os.path.basename(pdf_path)}"
-                enriched_caption = _describe_image_with_vision(filepath, raw_caption)
+                enriched_caption = _describe_image_with_ocr(filepath, raw_caption)
                 time.sleep(1)
 
                 image_records.append({
@@ -1031,9 +1161,12 @@ def extract_images(pdf_path: str,
         drawings           = page.get_drawings()
         page_table_bboxes  = table_bboxes_by_page.get(page_num, [])
 
-        if drawings and fig_captions and not page_extracted_xrefs:
+        if drawings and fig_captions:
             for idx, cap in enumerate(fig_captions):
+                if cap["text"] in consumed_captions:
+                    continue
                 cy0 = cap["bbox"].y0
+                cy1 = cap["bbox"].y1
                 cx0 = cap["bbox"].x0
                 cx1 = cap["bbox"].x1
 
@@ -1041,13 +1174,18 @@ def extract_images(pdf_path: str,
                 for d in drawings:
                     d_rect = d["rect"]
 
-                    # Must horizontally overlap the caption column
-                    overlap = max(0, min(cx1, d_rect.x1) - max(cx0, d_rect.x0))
-                    if overlap <= 30:
-                        continue
+                    # Bidirectional check: accept drawings either above or below the caption
+                    distance_limit = 650
+                    caption_above_figure = (
+                        d_rect.y0 > cy1 and
+                        d_rect.y0 < cy1 + distance_limit
+                    )
+                    figure_above_caption = (
+                        d_rect.y1 < cy0 and
+                        d_rect.y0 > cy0 - distance_limit
+                    )
 
-                    # Must be above the caption and within the capture window
-                    if not (d_rect.y1 < cy0 and d_rect.y0 > cy0 - 350):
+                    if not (caption_above_figure or figure_above_caption):
                         continue
 
                     # Skip full-width header/footer dividers
@@ -1066,15 +1204,53 @@ def extract_images(pdf_path: str,
                     if in_table:
                         continue
 
+                    if d_rect.height < 3 and d_rect.width > 30:
+                        continue
+                        
+                    if page_num == 31:
+                        print("PAGE 31 DRAWING ACCEPTED FOR CLUSTERING")
+
                     fig_rects.append(d_rect)
 
                 if not fig_rects:
                     continue
 
-                tx0 = min(r.x0 for r in fig_rects)
-                ty0 = min(r.y0 for r in fig_rects)
-                tx1 = max(r.x1 for r in fig_rects)
-                ty1 = max(r.y1 for r in fig_rects)
+                # Sort by top edge (y0)
+                fig_rects.sort(key=lambda r: r.y0)
+                
+                clusters = []
+                current_cluster = [fig_rects[0]]
+                
+                for r in fig_rects[1:]:
+                    last_r = current_cluster[-1]
+                    if r.y0 - last_r.y1 <= 15:
+                        current_cluster.append(r)
+                    else:
+                        clusters.append(current_cluster)
+                        current_cluster = [r]
+                clusters.append(current_cluster)
+                
+                valid_clusters = []
+                for cluster in clusters:
+                    tx0_c = min(r.x0 for r in cluster)
+                    tx1_c = max(r.x1 for r in cluster)
+                    overlap = max(0, min(cx1, tx1_c) - max(cx0, tx0_c))
+                    if overlap > 30:
+                        valid_clusters.append(cluster)
+                        
+                if not valid_clusters:
+                    continue
+                
+                # Find cluster closest to caption y0
+                def min_dist_to_cap(cluster):
+                    return min(abs(r.y1 - cy0) for r in cluster)
+                
+                best_cluster = min(valid_clusters, key=min_dist_to_cap)
+
+                tx0 = min(r.x0 for r in best_cluster)
+                ty0 = min(r.y0 for r in best_cluster)
+                tx1 = max(r.x1 for r in best_cluster)
+                ty1 = max(r.y1 for r in best_cluster)
 
                 # Expand box slightly to capture axis ticks and borders
                 tx0 = max(0, tx0 - 10)
@@ -1094,10 +1270,27 @@ def extract_images(pdf_path: str,
                         f"_page{page_num}_vector_fig_{idx+1}.png"
                     )
                     filepath = os.path.join(output_dir, filename)
-                    pix.save(filepath)
+                    img_bytes = pix.tobytes("png")
+                    raw_caption = cap["text"]
 
-                    raw_caption      = cap["text"]
-                    enriched_caption = _describe_image_with_vision(filepath, raw_caption)
+                    if not _validate_image_candidate(img_bytes, "vector", filename, raw_caption, seen_image_hashes, stats):
+                        continue
+
+                    with open(filepath, "wb") as f:
+                        f.write(img_bytes)
+
+                    print(f"Accepted image:\n{filename}\nsize: {clip_rect.width:.0f}x{clip_rect.height:.0f}\ncaption: {raw_caption[:60]!r}")
+                    
+                    if not os.path.isfile(filepath) or os.path.getsize(filepath) < 500:
+                        print(f"  [WARN] Skipping bad/empty image file: {filepath}")
+                        continue
+                        
+                    if clip_rect.height > 250:
+                        print(f"  [WARN] page {page_num} vector fig crop unusually large ({clip_rect.height:.0f}pt) — using caption only, skipping OCR enrichment")
+                        enriched_caption = raw_caption
+                    else:
+                        enriched_caption = _describe_image_with_ocr(filepath, raw_caption)
+                        
                     time.sleep(1)
 
                     image_records.append({
@@ -1112,6 +1305,16 @@ def extract_images(pdf_path: str,
                           f"{cap['text'][:50]}...")
                 except Exception as e:
                     print(f"Error rendering vector figure: {e}")
+
+    print(f"\nTotal candidates: {stats['total']}")
+    print(f"Accepted images: {stats['accepted']}")
+    print(f"Rejected images: {stats['total'] - stats['accepted']}")
+    print("\nRejected:")
+    print(f"- too small: {stats['rejected_too_small']}")
+    print(f"- extreme aspect ratio: {stats['rejected_aspect_ratio']}")
+    print(f"- low variance: {stats['rejected_low_variance']}")
+    print(f"- duplicate: {stats['rejected_duplicate']}")
+    print(f"\nWeak caption accepted:\n{stats['weak_caption_accepted']}\n")
 
     return image_records
 
@@ -1146,14 +1349,10 @@ def extract_text(pdf_path: str, table_records: list = None) -> list:
             if not text:
                 continue
 
-            overlap = False
-            for t_bbox in table_bboxes:
-                tx0, ty0, tx1, ty1 = t_bbox
-                if not (x1 < tx0 or x0 > tx1 or y1 < ty0 or y0 > ty1):
-                    overlap = True
-                    break
-            if overlap:
-                continue
+            # Removed overlap check: we want to keep text even if it falls inside a
+            # table bounding box, because TATR/PaddleOCR often fails to read 
+            # vertical headers (e.g. subsidiary names). Retaining the raw text
+            # provides a keyword fallback for the BM25 and semantic search.
 
             text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)
             text = re.sub(r'\n+', ' ', text)

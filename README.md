@@ -8,15 +8,15 @@ An AI-powered **Retrieval-Augmented Generation (RAG)** pipeline designed for dee
 
 - **Multi-Modal Extraction** — Text, tables, and figures are cleanly extracted and processed natively.
 - **Table-Aware Text Extraction** — Table and figure regions are geometrically masked out from body text to prevent corrupt, misaligned data from poisoning the context.
-- **Table Extraction (TATR)** — Uses Microsoft's **Table Transformer v1.1-all** (TATR) computer vision model to detect and perfectly parse tables into strict Markdown grids.
+- **Table Extraction (TATR)** — Uses Microsoft's **Table Transformer v1.1-all** (TATR) computer vision model to detect and accurately parse tables into strict Markdown grids.
 - **Table Summarization (Vector Blinding Fix)** — Raw markdown grids are notoriously hard for Dense embeddings to retrieve. Each table is summarized into a dense prose description by **Llama 3 8B** before embedding, dramatically improving semantic retrieval recall.
 - **Vision Descriptions** — Extracted vector figures and charts are described natively, making visuals fully searchable.
 - **Hybrid Retrieval** — FAISS (Dense) + BM25 (Sparse) are interleaved for lookups, with BM25 getting priority for exact keyword/metric matches (e.g., `mAP@[.5,.95]`).
 - **Cross-Encoder Reranking** — Retrieved text and image chunks are reranked using `ms-marco-MiniLM-L-6-v2` before being passed to the LLM.
 - **Query-Mode Routing** — Queries are automatically classified as `text`, `table`, `image`, or `hybrid` (analytical) and routed to the optimal retrieval strategy.
-- **Statistical Computation Layer** — A deterministic Python math layer. If a query asks for statistics ("mean", "median", "delta", "percentile"), the LLM extracts the raw cell values, and **NumPy/SciPy computes the exact answer**, eliminating LLM math hallucinations.
-- **Pandas Code-Gen Agent** — For pure table lookups, the LLM generates and executes Python/pandas code against parsed DataFrames (Program-Aided Language) for exact cell-level answers.
-- **Structured Q&A from Excel** — Reads queries from `Queries.xlsx`, answers them via the RAG pipeline, and writes answers back to the same file iteratively.
+- **Auto-Document Routing** — Queries are analyzed by an LLM to automatically detect the intended source document — removing the need for strict hardcoded Source filters.
+- **Structured Excel Export** — LLM-generated markdown tables are intercepted and natively parsed into Excel grid cells positioned cleanly below the main prose answer.
+- **Bidirectional Image Mapping** — Vector figures are intelligently mapped to their captions regardless of whether the caption is positioned above or below the chart.
 - **Cross-Document or Source Filtered Retrieval** — Natively supports searching across multiple PDFs or filtering to a specific paper.
 
 ---
@@ -34,8 +34,6 @@ An AI-powered **Retrieval-Augmented Generation (RAG)** pipeline designed for dee
 | **Table Extraction OCR** | Microsoft Table Transformer (`microsoft/table-transformer-structure-recognition-v1.1-all`) |
 | **LLM — Answering** | Llama-3.3-70B Versatile via Groq API |
 | **LLM — Table Summarization** | Llama 3 8B (8192 context) via Groq API |
-| **Statistical Math** | NumPy, SciPy |
-| **Pandas Agent** | LangChain `create_pandas_dataframe_agent` |
 | **Excel I/O** | pandas, openpyxl |
 
 ---
@@ -57,7 +55,8 @@ MultiModalRAG/
 ├── db/               # Auto-generated (gitignored)
 │   ├── faiss_index/        # Persisted FAISS vector index
 │   ├── tables.db           # SQLite table store
-│   └── bm25_tables.pkl     # Persisted BM25 retriever for tables
+│   ├── bm25_tables.pkl     # Persisted BM25 retriever for tables
+│   └── bm25_text.pkl       # Persisted BM25 retriever for text
 └── requirements.txt
 ```
 
@@ -77,12 +76,11 @@ MultiModalRAG/
 ### Query Phase (`python main.py`)
 
 1. Loads the FAISS index and BM25 retriever.
-2. Reads queries from `Queries.xlsx` (Optional `Source` column to filter by PDF filename; otherwise it searches globally).
+2. Reads queries from `Queries.xlsx`. The LLM auto-detects the relevant source document based on the question and the registry of indexed papers.
 3. The query is **routed** to one of four modes: `text`, `table`, `image`, or `hybrid` (analytical).
-4. If a statistical math operation is detected ("average", "delta", "percentile"), the pipeline extracts raw numerical cell values from the markdown table and uses Python (`numpy`) to output a deterministic math answer.
-5. For pure **table lookups**, a Pandas Code-Gen Agent parses retrieved tables into DataFrames and generates Python to retrieve exact cells.
-6. For **analytical hybrid queries**, context is truncated perfectly at block boundaries, combined with surrounding text chunks, and passed to **Llama 3.3 70B** to generate a highly cohesive, sourced response.
-7. Answers are written back iteratively to `Queries.xlsx`.
+4. For **table lookups**, if structured output is requested, the LLM generates both a prose explanation and a Markdown table.
+5. For **analytical hybrid queries**, context is truncated accurately at block boundaries, combined with surrounding text chunks, and passed to **Llama 3.3 70B** to generate a highly cohesive, sourced response.
+6. Answers are written back iteratively to `Queries.xlsx`. Prose answers go in column B, images are embedded in column C, and generated tables are natively written into Excel cells beneath the answer.
 
 ---
 
@@ -139,8 +137,8 @@ python main.py
 
 ## Queries.xlsx Format
 
-Each sheet should have a `Query` column. Answers will be written to column B automatically.
-An optional `Source` column can restrict a query to a specific PDF (by filename).
+Each sheet should have a `Query` column. Answers will be written to column B automatically, figures embedded in column C, and generated tables placed neatly below the answer cell.
+An optional `Source` column can restrict a query to a specific PDF (by filename). If omitted, the LLM will automatically detect the intended source document.
 
 | Query | Source | Answer |
 |---|---|---|

@@ -9,12 +9,10 @@ import os
 import time
 import pickle
 import json
-import numpy as np
-import pandas as pd
-import io
-from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
+
 
 bm25_retriever = None
+bm25_text_retriever = None
 
 # Registry built at index-load time: source_basename → list of sample text chunks.
 # Populated by load_index(); used by _auto_detect_source() to route queries
@@ -46,11 +44,16 @@ llm = ChatGroq(
 )
 
 def load_index(faiss_path: str = "db/faiss_index"):
-    global bm25_retriever, _source_registry
+    global bm25_retriever, bm25_text_retriever, _source_registry
     bm25_path = "db/bm25_tables.pkl"
     if os.path.exists(bm25_path):
         with open(bm25_path, "rb") as f:
             bm25_retriever = pickle.load(f)
+
+    bm25_text_path = "db/bm25_text.pkl"
+    if os.path.exists(bm25_text_path):
+        with open(bm25_text_path, "rb") as f:
+            bm25_text_retriever = pickle.load(f)
 
     vs = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
 
@@ -85,48 +88,6 @@ def _normalize_row(row: str) -> str:
     row_no_refs = re.sub(r"\s+", " ", row_no_refs).strip()
     return row_no_refs
 
-
-def markdown_to_dataframe(md_string: str) -> pd.DataFrame:
-    """
-    Safely parse a markdown table string into a pandas DataFrame.
-    """
-    lines = [line.strip() for line in md_string.split('\n') if line.strip().startswith('|')]
-    if not lines:
-        return pd.DataFrame()
-        
-    # Find the separator row
-    sep_idx = -1
-    for i, line in enumerate(lines):
-        if set(line.replace('|', '').replace(' ', '')) == {'-'}:
-            sep_idx = i
-            break
-            
-    if sep_idx > 1:
-        # Multi-row header detected. Skip pandas-agent by returning empty df.
-        return pd.DataFrame()
-        
-    # Remove the separator row
-    if sep_idx != -1:
-        lines = [line for i, line in enumerate(lines) if i != sep_idx]
-        
-    # Parse as CSV using | separator
-    csv_str = '\n'.join(lines)
-    # Remove leading/trailing |
-    csv_str = '\n'.join([line.strip('|') for line in csv_str.split('\n')])
-    try:
-        df = pd.read_csv(io.StringIO(csv_str), sep='|')
-        # Strip whitespace from column names and string cells
-        df.columns = df.columns.str.strip()
-        
-        # Detect unusable headers (lots of Unnamed)
-        unnamed = sum(1 for c in df.columns if str(c).startswith("Unnamed:"))
-        if unnamed > len(df.columns) / 2:
-            return pd.DataFrame()
-            
-        df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
-        return df
-    except Exception:
-        return pd.DataFrame()
 
 
 def clean_table_markdown(content: str) -> str:
@@ -164,178 +125,7 @@ def clean_table_markdown(content: str) -> str:
 
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# STATISTICAL COMPUTATION LAYER
-# Runs AFTER retrieval but BEFORE the LLM answer step. When a query asks for
-# a statistical operation over table data, Python computes the answer exactly.
-# ─────────────────────────────────────────────────────────────────────────────
 
-_STAT_OPERATIONS = [
-    # Each entry: (operation_name, trigger_keywords)
-    # Ordered longest-phrase-first to avoid false matches.
-    ("weighted_mean", ["weighted average", "weighted mean"]),
-    ("mean",          ["average", "mean", "avg"]),
-    ("median",        ["median"]),
-    ("mode",          ["most common", "most frequent", "mode"]),
-    ("range",         ["range", "spread", "min to max"]),
-    ("std",           ["standard deviation", "std dev", "std"]),
-    ("percentile",    ["percentile", "quantile"]),
-    ("delta",         ["delta", "gain", "improvement", "difference", "change",
-                       "increased by", "decreased by", "how much did"]),
-]
-
-
-def detect_stat_operation(query: str) -> str | None:
-    """
-    Return the name of the statistical operation requested in the query,
-    or None if the query is not asking for one.
-
-    Uses word-boundary matching for single-word keywords to prevent partial
-    matches (e.g. "mode" must not match inside "models").
-    """
-    q = query.lower()
-    for op, keywords in _STAT_OPERATIONS:
-        for kw in sorted(keywords, key=len, reverse=True):
-            if ' ' in kw:
-                if kw in q:
-                    return op
-            else:
-                if re.search(r'\b' + re.escape(kw) + r'\b', q):
-                    return op
-    return None
-
-
-def _llm_extract_values(query: str, raw_md: str, operation: str) -> list[float] | None:
-    """
-    Use the LLM strictly as a table reader to extract the exact numeric values
-    needed for Python to compute the statistic.
-
-    This approach:
-    - Handles PyMuPDF column-shift artifacts (messy markdown) gracefully.
-    - Handles natural-language row filters ("only BASE models", "ensemble only").
-    - Keeps all actual math in Python (numpy), not the LLM.
-
-    Returns a list of floats on success, or None / [] if the table doesn't
-    contain the requested data (so compute_stat moves to the next candidate).
-    """
-    prompt = (
-        f"You are a precise data extractor.\n"
-        f"The user wants to perform a '{operation}' statistical operation based on this query:\n"
-        f"Query: \"{query}\"\n\n"
-        f"Here is the markdown table:\n{raw_md}\n\n"
-        f"Extract the EXACT numerical values from the table needed to compute this statistic.\n"
-        f"Rules:\n"
-        f"- For aggregate operations (mean/median/mode/range/std/percentile): extract ALL relevant values from the correct column, filtered to the rows the query specifies (e.g. 'all BASE models', 'all ensemble methods').\n"
-        f"- For delta/gain/difference: extract exactly two values in order [from_value, to_value].\n"
-        f"- If this table does NOT contain the data the query refers to, return: []\n\n"
-        f"Return ONLY a valid JSON list of floats. No explanation, no markdown, no code blocks.\n"
-    )
-    try:
-        response = llm.invoke([HumanMessage(content=prompt)])
-        raw = response.content.strip()
-        # Strip any accidental markdown fences
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
-        values = json.loads(raw)
-        if isinstance(values, list):
-            return [float(v) for v in values if str(v).strip() not in ("", "null", "None")]
-    except Exception as e:
-        print(f"  [_llm_extract_values error] {e}")
-    return None
-
-
-def compute_stat(operation: str, query: str, docs: list) -> str | None:
-    """
-    Run a deterministic statistical computation over retrieved table docs.
-
-    For each table doc:
-      1. Ask the LLM (as a reader) to extract the relevant float values.
-      2. If values found, run numpy/scipy math on them.
-      3. Return the answer string.
-      4. If no values found, try the next table. If all tables exhausted, return None.
-
-    The LLM is used ONLY for reading/extracting values — all math is Python.
-    """
-    print(f"  [compute_stat] operation={operation!r}, docs={len(docs)}")
-    for doc in docs:
-        if doc.metadata.get("type") != "table":
-            continue
-
-        raw_md = doc.metadata.get("raw_table_markdown", doc.page_content)
-        tbl_path = doc.metadata.get("table_path", "")
-
-        print(f"  [compute_stat] trying table: {tbl_path}")
-        values = _llm_extract_values(query, raw_md, operation)
-        print(f"  [compute_stat] extracted values: {values}")
-
-        if not values:
-            continue
-
-        citation = f"\n\n[Source Table: {tbl_path}]" if tbl_path else ""
-        vals = np.array(values, dtype=float)
-        n = len(vals)
-
-        if operation == "delta":
-            if n < 2:
-                continue
-            val_a, val_b = vals[0], vals[1]
-            delta = round(float(val_b - val_a), 4)
-            sign = "+" if delta >= 0 else ""
-            return (
-                f"Delta: {sign}{delta} "
-                f"({round(float(val_a), 4)} -> {round(float(val_b), 4)})"
-                f"{citation}"
-            )
-
-        if n == 0:
-            continue
-
-        if operation == "mean":
-            ans = round(float(np.mean(vals)), 4)
-            return f"Mean across {n} values: {ans}{citation}"
-
-        elif operation == "median":
-            ans = round(float(np.median(vals)), 4)
-            return f"Median across {n} values: {ans}{citation}"
-
-        elif operation == "mode":
-            try:
-                from scipy import stats as _scipy_stats
-                m = _scipy_stats.mode(vals, keepdims=False)
-                ans = round(float(m.mode), 4)
-            except Exception:
-                unique, counts = np.unique(vals, return_counts=True)
-                ans = round(float(unique[np.argmax(counts)]), 4)
-            return f"Mode across {n} values: {ans}{citation}"
-
-        elif operation == "range":
-            mn, mx = float(np.min(vals)), float(np.max(vals))
-            span = round(mx - mn, 4)
-            return (
-                f"Range: {span} "
-                f"(min={round(mn, 4)}, max={round(mx, 4)}) "
-                f"across {n} values{citation}"
-            )
-
-        elif operation == "std":
-            pop_std = round(float(np.std(vals, ddof=0)), 4)
-            samp_std = round(float(np.std(vals, ddof=1)) if n > 1 else 0.0, 4)
-            return (
-                f"Std dev across {n} values: "
-                f"{pop_std} (population) / {samp_std} (sample)"
-                f"{citation}"
-            )
-
-        elif operation == "percentile":
-            ans = round(float(np.percentile(vals, 90)), 4)
-            return f"90th percentile across {n} values: {ans}{citation}"
-
-        elif operation == "weighted_mean":
-            ans = round(float(np.mean(vals)), 4)
-            return f"Weighted mean across {n} values: {ans}{citation}"
-
-    print("  [compute_stat] no values found in any table — returning None")
-    return None
 
 
 def _llm_classify_query(query: str) -> dict:
@@ -348,7 +138,9 @@ def _llm_classify_query(query: str) -> dict:
         f'  "wants_image_data": true if the query asks about charts, graphs, figures, diagrams, '
         f'or any visual content.\n'
         f'  "needs_analysis": true if the query asks for explanations, reasons, trends, tradeoffs, '
-        f'or interpretation (why/how) rather than just a fact lookup.\n'
+        f'or interpretation (why/how) rather than just a fact lookup. '
+        f'CRITICAL EXCEPTION: YOU MUST ALSO SET THIS TO TRUE when the query asks for a list, identities, or headcount of personnel/board members, or a count/quantity/percentage of a named business activity. '
+        f'Such facts typically appear in prose sections rather than structured tables and require more text slots to retrieve.\n'
         f'  "format_as_table": true if the query asks for a ranked list, comparison table, '
         f'or explicitly requests tabular output.\n\n'
         f'Query: "{query}"\n\n'
@@ -430,7 +222,7 @@ def retrieve(query: str, vectorstore, intent: dict, k: int = 6, source_filter: s
     else:
         mode = "text"
 
-    fetch_k = 40 if source_filter is None else 8
+    fetch_k = 40 if source_filter is None else 30
     raw_docs = vectorstore.similarity_search(query, k=fetch_k)
 
     if source_filter:
@@ -448,7 +240,7 @@ def retrieve(query: str, vectorstore, intent: dict, k: int = 6, source_filter: s
         seen_content = set()
 
         # --- HYBRID SEARCH: FAISS + BM25 ---
-        table_pool_k = 60 if source_filter is None else 12
+        table_pool_k = 60 if source_filter is None else 80
         faiss_raw = vectorstore.similarity_search(query, k=table_pool_k)
         if source_filter:
             faiss_table_docs = [d for d in faiss_raw if _matches_source(d, source_filter)]
@@ -512,24 +304,60 @@ def retrieve(query: str, vectorstore, intent: dict, k: int = 6, source_filter: s
         if not table_docs:
             table_docs = [d for d in raw_docs if d.metadata.get("type") == "table"]
 
-        # FIX #2: Always reserve 2 slots for top text docs so the LLM has
-        # prose context for analytical questions. Previously text was only
-        # added when table_docs < 4, which almost never triggered.
+        # ── GENERAL MULTI-PAGE TABLE CONTINUATION RETRIEVAL ─────────────────────
+        # If a retrieved table is part of a multi-page table group, fetch all other
+        # tables in that exact same group so the LLM gets the entire schedule.
+        table_group_ids_in_results = {
+            doc.metadata.get("table_group_id")
+            for doc in table_docs
+            if doc.metadata.get("table_group_id")
+        }
+        if table_group_ids_in_results:
+            for doc_id, doc in vectorstore.docstore._dict.items():
+                if doc.metadata.get("type") != "table":
+                    continue
+                grp = doc.metadata.get("table_group_id")
+                if not grp or grp not in table_group_ids_in_results:
+                    continue
+                if source_filter and not _matches_source(doc, source_filter):
+                    continue
+                content = doc.page_content.strip()
+                raw_md = doc.metadata.get("raw_table_markdown", content)
+                if content not in seen_content and raw_md not in seen_raw_markdown:
+                    table_docs.insert(0, doc)
+                    seen_content.add(content)
+                    seen_raw_markdown.add(raw_md)
+
+        # ── TEXT CANDIDATES: FAISS + BM25 TEXT ────────────────────────────────
+        # Pull text docs from FAISS results first, then supplement with BM25
+        # text retriever. BM25 keyword matching surfaces narrative pages that semantic
+        # search often misses in favor of financial tables.
         text_candidates = [
             d for d in raw_docs
             if d.metadata.get("type") == "text"
             and d.page_content.strip() not in seen_content
         ]
-        # Dynamic context allocation slider.
-        # Pure table lookups ("what is the highest F1?") get zero prose slots so
-        # all 6 return positions are available for dense table data.
-        # Analytical and hybrid queries still reserve prose for explanation.
+        if bm25_text_retriever is not None:
+            try:
+                old_k = getattr(bm25_text_retriever, "k", 4)
+                bm25_text_retriever.k = 12
+                bm25_text_extra = bm25_text_retriever.invoke(query)
+                bm25_text_retriever.k = old_k
+                if source_filter:
+                    bm25_text_extra = [d for d in bm25_text_extra
+                                       if _matches_source(d, source_filter)]
+                for d in bm25_text_extra:
+                    if d.page_content.strip() not in seen_content:
+                        text_candidates.append(d)
+            except Exception:
+                pass
+
         if mode == "hybrid":
-            text_slots = 2
+            text_slots = 3
         elif intent.get("needs_analysis"):
-            text_slots = 1
+            text_slots = 2
         else:
-            text_slots = 0  # pure lookup — give every slot to tables
+            text_slots = 1
 
         top_text = (
             rerank_docs(query, _unique_docs(text_candidates), top_n=text_slots)
@@ -538,10 +366,28 @@ def retrieve(query: str, vectorstore, intent: dict, k: int = 6, source_filter: s
         )
         for doc in top_text:
             seen_content.add(doc.page_content.strip())
-        table_docs = _unique_docs(table_docs) + top_text
 
-        # BYPASS CROSS-ENCODER RERANKER FOR TABLES (It destroys markdown)
-        return table_docs[:6]
+        # ── SLOT-PRIORITY ASSEMBLY ─────────────────────────────────────────────
+        # Critical: text docs go FIRST so [:limit] never cuts them off.
+        # Table slots are trimmed to make room: max_table_slots = limit - text - image.
+        _TOTAL_LIMIT = 12
+        ordered_tables = _unique_docs(table_docs)
+
+        max_table_slots = _TOTAL_LIMIT - len(top_text) - 1  # reserve 1 for image
+        trimmed_tables = ordered_tables[:max_table_slots]
+
+        # Include the top-1 most relevant image doc.
+        image_candidates = [
+            d for d in raw_docs
+            if d.metadata.get("type") == "image"
+            and d.page_content.strip() not in seen_content
+        ]
+        top_image = []
+        if image_candidates:
+            _img_ranked = rerank_docs(query, _unique_docs(image_candidates), top_n=1)
+            top_image = [d for d in _img_ranked if d.page_content.strip() not in seen_content]
+
+        return top_text + trimmed_tables + top_image
 
     if mode == "image":
         image_docs = [d for d in raw_docs if d.metadata.get("type") == "image"]
@@ -549,12 +395,42 @@ def retrieve(query: str, vectorstore, intent: dict, k: int = 6, source_filter: s
             image_docs = raw_docs
         return rerank_docs(query, _unique_docs(image_docs), top_n=3)
 
+    # ── Text / fallback branch ────────────────────────────────────────────────
     text_docs = [d for d in raw_docs if d.metadata.get("type") == "text"]
     if not text_docs:
         text_docs = raw_docs
-    return rerank_docs(query, _unique_docs(text_docs), top_n=5)    
 
-    
+    # Merge BM25 text results (2:1 ratio vs FAISS) for better exact-keyword recall
+    if bm25_text_retriever is not None:
+        bm25_text_retriever.k = 6
+        try:
+            bm25_text_results = bm25_text_retriever.invoke(query)
+            # Apply source filter if active
+            if source_filter:
+                bm25_text_results = [d for d in bm25_text_results
+                                     if _matches_source(d, source_filter)]
+        except Exception:
+            bm25_text_results = []
+
+        # 2:1 interleave: BM25 first, then FAISS
+        merged = []
+        bm25_iter = iter(bm25_text_results)
+        faiss_iter = iter(text_docs)
+        while True:
+            b1 = next(bm25_iter, None)
+            b2 = next(bm25_iter, None)
+            f1 = next(faiss_iter, None)
+            if b1 is None and b2 is None and f1 is None:
+                break
+            if b1 is not None:
+                merged.append(b1)
+            if b2 is not None:
+                merged.append(b2)
+            if f1 is not None:
+                merged.append(f1)
+        text_docs = _unique_docs(merged)
+
+    return rerank_docs(query, _unique_docs(text_docs), top_n=5)
 
 
 def get_page_docs(vectorstore, page_num: int, source_filter: str = None) -> list:
@@ -570,21 +446,62 @@ def get_page_docs(vectorstore, page_num: int, source_filter: str = None) -> list
     return _unique_docs(all_docs)
 
 
+_TPD_WAIT_RE = re.compile(r"try again in (\d+)m([\d.]+)s", re.IGNORECASE)
+_TPD_CAP_SECONDS = 20 * 60  # 20-minute maximum auto-sleep for daily quota errors
+
+
 def _invoke_llm_with_retry(prompt: str, retries: int = 3, base_sleep: int = 6):
     """
-    Retry on Groq rate-limit errors.
+    Retry on Groq rate-limit errors, distinguishing two error classes:
+
+    Per-minute (TPM) limits  → short exponential back-off (6 s, 12 s, 18 s).
+    Per-day    (TPD) limits  → parse the stated wait from the error message and
+                               sleep exactly that long (once), then retry once.
+                               If the stated wait exceeds 20 minutes, raise
+                               immediately with a clear user-facing message
+                               rather than burning retries on useless short sleeps.
     """
     last_exc = None
     for attempt in range(retries):
         try:
             return llm.invoke(prompt)
         except Exception as exc:
-            msg = str(exc).lower()
-            if "rate limit" in msg or "tokens per minute" in msg or "429" in msg:
-                last_exc = exc
+            msg = str(exc)
+            msg_lower = msg.lower()
+
+            if "429" not in msg_lower and "rate limit" not in msg_lower and "tokens per" not in msg_lower:
+                raise  # Not a rate-limit error — propagate immediately
+
+            last_exc = exc
+            is_tpd = "tokens per day" in msg_lower or "tpd" in msg_lower or "daily" in msg_lower
+
+            if is_tpd:
+                # Try to parse the exact wait time Groq states in the message
+                m = _TPD_WAIT_RE.search(msg)
+                if m:
+                    wait_seconds = int(m.group(1)) * 60 + float(m.group(2))
+                    if wait_seconds > _TPD_CAP_SECONDS:
+                        raise RuntimeError(
+                            f"Groq daily token quota exhausted. "
+                            f"Groq says to wait {wait_seconds/60:.1f} minutes, "
+                            f"which exceeds the 20-minute auto-sleep cap. "
+                            f"Please wait or upgrade your Groq tier, then retry."
+                        ) from exc
+                    print(f"  [LLM] Daily quota (TPD) limit hit. "
+                          f"Sleeping {wait_seconds:.0f}s as instructed by Groq...")
+                    time.sleep(wait_seconds)
+                    continue  # one retry after the exact sleep
+                else:
+                    # TPD error but no parseable wait — fall back to long sleep
+                    print("  [LLM] Daily quota (TPD) limit hit (no wait time in message). "
+                          "Sleeping 60s and retrying once...")
+                    time.sleep(60)
+                    continue
+            else:
+                # Per-minute (TPM) limit — exponential back-off
                 time.sleep(base_sleep * (attempt + 1))
                 continue
-            raise
+
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("LLM invocation failed.")
@@ -661,7 +578,6 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
         mode = "hybrid" if intent.get("needs_analysis") else "table"
     else:
         mode = "text"
-
     if page_match:
         page_num = int(page_match.group(1))
         docs = get_page_docs(vectorstore, page_num, source_filter=source_filter)
@@ -669,20 +585,18 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
             docs = retrieve(query, vectorstore, intent, source_filter=source_filter)
     else:
         docs = retrieve(query, vectorstore, intent, source_filter=source_filter)
+    
+    # If the user is just asking for an image, bypass the blind LLM and return the image tags directly
+    if intent.get("wants_image_data"):
+        image_tags = []
+        for r in docs:
+            if r.metadata.get("type") == "image" and "image_path" in r.metadata:
+                image_tags.append(f"[Source Image: {r.metadata['image_path']}]")
+        if image_tags:
+            return "\n\n".join(image_tags)
+        return "No relevant image found in the document."
 
-    # ── STATISTICAL COMPUTATION LAYER ────────────────────────────────────────
-    # Check BEFORE the pandas agent or LLM path. If the query asks for a
-    # statistical operation (mean, range, std, delta, etc.), compute it with
-    # Python (numpy) using values extracted by the LLM from the raw markdown.
-    stat_op = detect_stat_operation(query)
-    print(f"  [answer_query] stat_op detected: {stat_op!r}")
-    if stat_op is not None:
-        stat_answer = compute_stat(stat_op, query, docs)
-        if stat_answer is not None:
-            print(f"  [answer_query] stat layer returned answer, short-circuiting LLM.")
-            return stat_answer
-        print("  [answer_query] stat layer returned None — falling through to LLM.")
-    # ─────────────────────────────────────────────────────────────────────────
+    mode = "hybrid" if intent.get("wants_table_data") and intent.get("needs_analysis") else ("table" if intent.get("wants_table_data") else "text")
 
     formatted_contexts = []
     referenced_tables = []
@@ -727,7 +641,7 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
 
     # FIX #5: Truncate between document blocks, not mid-string.
     # This prevents the LLM from receiving a half-cut markdown table row.
-    MAX_CONTEXT_CHARS = 12000 if mode in ("table", "hybrid") else 6500
+    MAX_CONTEXT_CHARS = 18000 if mode in ("table", "hybrid") else 8000
     if len(context) > MAX_CONTEXT_CHARS:
         # Walk backwards from the char limit to find the nearest block boundary
         cutoff = context.rfind("\n\n", 0, MAX_CONTEXT_CHARS)
@@ -741,100 +655,42 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
     
     wants_table = intent.get("format_as_table")
 
-    if mode in ("table", "hybrid") and not _needs_discussion:
-        # PANDAS CODE-GEN AGENT (Program-Aided Language)
-        # Instead of asking the LLM to 'read' the text matrix, we formally parse
-        # the retrieved tables into DataFrames and let the LLM generate/execute Python.
-        
-        dfs = []
-        for doc in docs:
-            if doc.metadata.get("type") == "table":
-                raw_md = doc.metadata.get("raw_table_markdown", doc.page_content)
-                df = markdown_to_dataframe(raw_md)
-                if not df.empty:
-                    dfs.append(df)
-                    
-        if dfs:
-            try:
-                # Use zero-shot-react-description since tool-calling is less stable on Groq
-                agent = create_pandas_dataframe_agent(
-                    llm, 
-                    dfs, 
-                    verbose=False,
-                    allow_dangerous_code=True,
-                    agent_type="zero-shot-react-description",
-                    max_iterations=4
-                )
-                if wants_table:
-                    agent_prompt = f"Answer the query based on the data. Return a clean MARKDOWN TABLE. Do not include any code or explanations. Query: {query}"
-                else:
-                    agent_prompt = f"Answer in MAXIMUM ONE SENTENCE with the exact value or metric. Do not include any explanations or code. Query: {query}"
-                
-                answer = agent.invoke({"input": agent_prompt})
-                answer_text = answer.get("output", str(answer))
-                
-                # BUG 2: Sanity check agent output
-                rejected = False
-                if "(#:" in answer_text or "Agent stopped" in answer_text:
-                    rejected = True
-                elif not wants_table and "|" in answer_text:
-                    rejected = True
-                else:
-                    # Extract words and numbers from answer
-                    ans_tokens = set(re.findall(r'\b[a-zA-Z0-9.\-]+\b', answer_text))
-                    # Combine raw markdown
-                    raw_md = " ".join([doc.metadata.get("raw_table_markdown", doc.page_content) for doc in docs if doc.metadata.get("type") == "table"])
-                    # Check if at least one meaningful token appears in the raw table markdown
-                    if "not found" not in answer_text.lower():
-                        has_overlap = False
-                        for t in ans_tokens:
-                            if len(t) > 1 or t.isdigit():
-                                if t in raw_md:
-                                    has_overlap = True
-                                    break
-                        if not has_overlap and ans_tokens:
-                            rejected = True
-                
-                if not rejected:
-                    if not any(p in answer_text.lower() for p in _FAILURE_PHRASES):
-                        if "[Source Table:" not in answer_text and referenced_tables:
-                            answer_text += f"\n\n[Source Table: {referenced_tables[0]}]"
-                    return answer_text
-                else:
-                    print("Pandas Agent returned invalid output or stopped, falling back to standard LLM table lookup...")
-                    
-            except Exception as e:
-                # Fallback to standard prompt if the agent hits a parsing error or iteration limit
-                print(f"Pandas Agent failed ({e}), falling back to standard LLM table lookup...")
-                
-        # Pure lookup fallback prompt if agent failed or no valid DFS parsed
-        if wants_table:
-            prompt = f"""You are a precise data analyst. Answer using ONLY the provided context.
-        Return a clean MARKDOWN TABLE with the requested data. Do not explain.
+    if wants_table:
+        prompt = f"""You are a precise data analyst. Answer using ONLY the provided context.
+First, provide a short natural language explanation or discussion answering the query.
+Then, provide a clean MARKDOWN TABLE containing the requested structured data.
 
-        Context:
-        {context}
+Context:
+{context}
 
-        Question: {query}
+Question: {query}
 
-        - Identify the correct table, rows and columns.
-        - Output a markdown table.
-        - If the value is not in the context, say "Not found in context".
+Instructions:
+- Check ALL context sections: TABLE data, TEXT passages, and IMAGE captions.
+- Quote exact numbers from tables where relevant.
+- Output BOTH a natural language explanation and a markdown table.
+- If the value is not in the context, say "Not found in context".
 
-        Answer:"""
-        else:
-            prompt = f"""You are a precise data analyst. Answer using ONLY the provided context in MAXIMUM ONE SENTENCE. Do not explain.
+Answer:"""
+    elif mode in ("table", "hybrid") and not _needs_discussion:
+        prompt = f"""You are a precise data analyst. Answer using ONLY the provided context.
+Give a concise, direct answer. Do not explain or add commentary.
 
-        Context:
-        {context}
+Context:
+{context}
 
-        Question: {query}
+Question: {query}
 
-        - Identify the correct table, row and column.
-        - Quote the exact value from the table.
-        - If the value is not in the context, say "Not found in context".
+Important:
+- Check ALL context sections: TABLE data, TEXT passages, and IMAGE captions.
+- Some tables were extracted from a PDF and may have garbled column headers or
+  merged cells (e.g. "S ca hange ti" = "Share capital / Exchange rate"). Do your
+  best to read the values even when formatting is imperfect.
+- For exchange rates, look for patterns like "1 EUR = `105.47" or "EUR `105.47".
+- Quote the exact value or figure from whichever section contains it.
+- If the answer genuinely cannot be found anywhere in the context, say "Not found in context".
 
-        Answer:"""
+Answer:"""
     elif mode in ("table", "hybrid") and _needs_discussion:
         # Analytical: compare, explain, discuss using both tables AND text
         prompt = f"""You are an expert research analyst. Answer using ONLY the provided context.
@@ -855,9 +711,12 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
 
         Answer:"""
     elif mode == "image":
-        prompt = f"""You are an expert at reading research paper figures.
-        The context below contains figure captions AND detailed Vision Descriptions
-        generated by analysing the actual image. Use ALL of this information to answer.
+        prompt = f"""You are an analyst reading figures from an annual/research report.
+
+        The context below contains each figure's caption and any text that OCR was able to
+        read from inside the image (axis labels, legend entries, numerical annotations, etc.).
+        This does NOT include descriptions of colors, icon shapes, chart types, or spatial
+        layout — only text that was legible inside the image.
 
         Context:
         {context}
@@ -865,10 +724,12 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
         Question: {query}
 
         Instructions:
-        - Use the Vision Description to answer questions about what the figure shows.
-        - Quote specific details: axis labels, values, trends, structural elements.
-        - If a specific detail is genuinely not mentioned anywhere in the context, say so.
-        - Do NOT say "visual content is not available" — use the Vision Description instead.
+        - Answer using ONLY what is stated in the caption or OCR text above.
+        - If the question asks about visual design elements (icons, colors, shapes, layout)
+          that are not captured as readable text, say plainly:
+          "The available context only includes the figure's caption and embedded text (via OCR),
+          not a visual description, so this detail is not available."
+        - Do NOT guess, infer, or invent any visual details.
 
         Answer:"""
     else:

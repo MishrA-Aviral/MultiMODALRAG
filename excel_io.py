@@ -3,6 +3,7 @@ import os
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 
 def read_queries(filepath: str) -> dict:
     """Read queries from the Excel file grouping by 'annexures'.
@@ -65,6 +66,38 @@ def _extract_image_path(text: str):
     return text.strip(), image_path
 
 
+def _image_already_at(ws, row: int, col: int) -> bool:
+    """
+    Return True if *ws* already has an image anchored at (row, col).
+
+    write_answers() re-opens and re-saves the workbook on every incremental
+    save (main.py calls it after every single query, for every sheet
+    processed so far). Without this check, the same image gets re-embedded
+    at the same cell on every subsequent save, stacking dozens of duplicate
+    copies on top of each other (see: 65 copies of one image in Annexure 2).
+
+    Handles both possible anchor representations:
+    - a plain string like "C2" (freshly set via ws.add_image(img, "C2"), not
+      yet normalized by openpyxl)
+    - a OneCellAnchor/TwoCellAnchor object (what you get back after
+      load_workbook() re-parses a saved file); its `_from.row`/`_from.col`
+      are 0-indexed, so we add 1 to match openpyxl's 1-indexed row/col args.
+    """
+    for img in ws._images:
+        anchor = img.anchor
+        try:
+            if isinstance(anchor, str):
+                r, c = coordinate_to_tuple(anchor)
+            else:
+                r = anchor._from.row + 1
+                c = anchor._from.col + 1
+        except Exception:
+            continue
+        if r == row and c == col:
+            return True
+    return False
+
+
 def _embed_image(ws, image_path: str, row: int, col: int) -> int:
     """
     Embed *image_path* into *ws* at the given (row, col) position.
@@ -73,8 +106,12 @@ def _embed_image(ws, image_path: str, row: int, col: int) -> int:
     (approximately 0.75 × pixel height), so the caller can resize the row.
     Returns 0 on any failure (missing file, unsupported format, etc.).
     """
+    image_path = os.path.normpath(image_path) if image_path else image_path
     if not image_path or not os.path.isfile(image_path):
-        print(f"  [excel_io] image not found, skipping embed: {image_path!r}")
+        print(f"  [excel_io] image not found, skipping embed: {image_path!r} (resolved: {os.path.abspath(image_path) if image_path else None!r})")
+        return 0
+    if _image_already_at(ws, row, col):
+        # Already embedded on a prior incremental save — skip to avoid duplicates.
         return 0
     try:
         from openpyxl.drawing.image import Image as XLImage
@@ -152,8 +189,15 @@ def write_answers(filepath: str, answers: dict, all_queries: dict):
             table_lines = [line.strip() for line in lines if line.strip().startswith('|')]
 
             if len(table_lines) >= 3:
-                # Mark the query row, then dump the table below
-                ws.cell(row=i, column=2, value=f"→ See table below (row {current_table_row})")
+                # Keep non-table lines for the main answer cell
+                prose_lines = [line for line in lines if not line.strip().startswith('|')]
+                prose_text = "\n".join(prose_lines).strip()
+                if prose_text:
+                    ans_text = f"{prose_text}\n\n→ See table below (row {current_table_row})"
+                else:
+                    ans_text = f"→ See table below (row {current_table_row})"
+                
+                ws.cell(row=i, column=2, value=ans_text)
 
                 # Write a label in col A so the reader knows which query owns this table
                 ws.cell(row=current_table_row, column=1, value=f"[Query: {q_text[:50]}...]")

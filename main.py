@@ -1,10 +1,11 @@
 from excel_io import read_queries, write_answers
 from extractor import extract_text, extract_tables, extract_images
-from indexer import index_text, index_tables, index_image_captions
+from indexer import index_text, index_bm25_text, index_tables, index_image_captions
 from retriever import load_index, answer_query
 import os
 import shutil
 import time
+from tqdm import tqdm
 
 def index_papers(papers_dir: str = "data/papers", reset_index: bool = True):
     pdfs = [f for f in os.listdir(papers_dir) if f.endswith(".pdf")]
@@ -20,13 +21,15 @@ def index_papers(papers_dir: str = "data/papers", reset_index: bool = True):
             os.remove("db/tables.db")
         if os.path.exists("db/bm25_tables.pkl"):
             os.remove("db/bm25_tables.pkl")
+        if os.path.exists("db/bm25_text.pkl"):
+            os.remove("db/bm25_text.pkl")
         # Also clean up previously extracted artifacts
         if os.path.exists("data/extracted_tables"):
             shutil.rmtree("data/extracted_tables")
         if os.path.exists("data/extracted_images"):
             shutil.rmtree("data/extracted_images")
             
-    for pdf in pdfs:
+    for pdf in tqdm(pdfs, desc="Indexing PDFs"):
         pdf_path = os.path.join(papers_dir, pdf)
         print(f"\nProcessing: {pdf}")
         
@@ -44,6 +47,7 @@ def index_papers(papers_dir: str = "data/papers", reset_index: bool = True):
         
         print("  Step 4: Indexing text...")
         index_text(pages, pdf)
+        index_bm25_text(pages, pdf)
         
         print("  Step 5: Indexing image captions...")
         index_image_captions(images)
@@ -71,7 +75,8 @@ def run_pipeline(excel_path: str = "Queries.xlsx"):
             
             try:
                 answer = answer_query(q, vectorstore, source_filter=source_filter)
-                print(f"  A: {answer[:150]}...")
+                safe_ans = answer[:150].encode('cp1252', 'replace').decode('cp1252')
+                print(f"  A: {safe_ans}...")
             except Exception as e:
                 print(f"  [ERROR] {e}")
                 answer = f"ERROR: {e}"
