@@ -127,7 +127,9 @@ def index_image_captions(image_records: list, faiss_path: str = "db/faiss_index"
     print(f"  {len(docs)} image captions indexed")
 
 SUMMARY_CACHE_PATH = "db/summary_cache.json"
-_BATCH_SIZE = 5
+MAX_SUMMARY_BATCH_SIZE = 20
+MAX_TABLE_CHARS = 4000
+MIN_BATCH_SIZE = 1
 
 def _load_summary_cache() -> dict:
     if os.path.exists(SUMMARY_CACHE_PATH):
@@ -146,15 +148,21 @@ def _table_hash(content: str, caption: str) -> str:
     raw = f"{caption}||{content}".encode("utf-8", errors="replace")
     return hashlib.sha256(raw).hexdigest()[:20]
 
-def _summarize_batch(batch: list) -> list | None:
+def _summarize_batch(batch: list, is_truncated: bool = False) -> list | None:
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key: return None
+
+    print(f"    [batch summarize] Summarizing batch of {len(batch)} tables...")
 
     tables_block = ""
     for idx, item in enumerate(batch):
         cap = (item.get("caption") or "").strip()
         caption_line = f'Caption: "{cap}"\n' if cap else ""
-        tables_block += f"TABLE {idx + 1}:\n{caption_line}{item['content']}\n\n---\n\n"
+        content = item['content']
+        if is_truncated and len(batch) == MIN_BATCH_SIZE:
+            if len(content) > MAX_TABLE_CHARS:
+                content = content[:MAX_TABLE_CHARS] + "\n... (truncated)"
+        tables_block += f"TABLE {idx + 1}:\n{caption_line}{content}\n\n---\n\n"
 
     prompt = (
         f"You are a precise financial data analyst. "
@@ -173,6 +181,9 @@ def _summarize_batch(batch: list) -> list | None:
         f"{tables_block}"
     )
 
+    current_prompt = prompt
+    strict_prompt_added = False
+
     max_retries = 3
     for attempt in range(max_retries):
         try:
@@ -182,7 +193,7 @@ def _summarize_batch(batch: list) -> list | None:
                 max_tokens=min(500 * len(batch), 2000),
                 api_key=api_key,
             )
-            response = summarizer.invoke(prompt)
+            response = summarizer.invoke(current_prompt)
             raw = response.content.strip()
 
             # Strip markdown code fences (```json ... ``` or ``` ... ```)
@@ -204,14 +215,67 @@ def _summarize_batch(batch: list) -> list | None:
                             break
                 raw = raw[start:end + 1]
 
-            result = json.loads(raw)
-            if isinstance(result, list) and len(result) == len(batch):
-                return [str(s).strip() for s in result]
-            # Length mismatch — retry rather than silently giving up
-            print(f"    [batch summarize] length mismatch: got {len(result)}, expected {len(batch)}. Retrying...")
+            try:
+                result = json.loads(raw)
+                if isinstance(result, list) and len(result) == len(batch):
+                    return [str(s).strip() for s in result]
+                
+                # Length mismatch
+                received = len(result) if isinstance(result, list) else 0
+                if not strict_prompt_added:
+                    print(f"    [batch summarize] Expected {len(batch)} summaries, received {received}.")
+                    print("    [batch summarize] Retrying with strict JSON prompt...")
+                    current_prompt = prompt + (
+                        f"\n\nYou must return ONLY a valid JSON array.\n"
+                        f"Do not include markdown.\n"
+                        f"Do not include explanations.\n"
+                        f"Return exactly {len(batch)} summaries."
+                    )
+                    strict_prompt_added = True
+                    continue
+                else:
+                    print(f"    [batch summarize] Expected {len(batch)} summaries, received {received}.")
+                    print("    [batch summarize] Falling back to individual summarization.")
+                    return None
+
+            except json.JSONDecodeError:
+                if not strict_prompt_added:
+                    print("    [batch summarize] JSON parsing failed.")
+                    print("    [batch summarize] Retrying with strict JSON prompt...")
+                    current_prompt = prompt + (
+                        f"\n\nYou must return ONLY a valid JSON array.\n"
+                        f"Do not include markdown.\n"
+                        f"Do not include explanations.\n"
+                        f"Return exactly {len(batch)} summaries."
+                    )
+                    strict_prompt_added = True
+                    continue
+                else:
+                    print("    [batch summarize] JSON parsing failed.")
+                    print("    [batch summarize] Falling back to individual summarization.")
+                    return None
+
         except Exception as exc:
             err_str = str(exc).lower()
-            if "429" in err_str or "rate limit" in err_str:
+            if "413" in err_str or "request too large" in err_str:
+                print(f"    [batch summarize] Request too large.")
+                if len(batch) > MIN_BATCH_SIZE:
+                    mid = len(batch) // 2
+                    print(f"    [batch summarize] Retrying as {mid} + {len(batch) - mid}...")
+                    left = _summarize_batch(batch[:mid])
+                    right = _summarize_batch(batch[mid:])
+                    if left is not None and right is not None:
+                        return left + right
+                    return None
+                else:
+                    if not is_truncated:
+                        print("    [batch summarize] Table exceeded maximum size.")
+                        print("    [batch summarize] Summarizing truncated content.")
+                        return _summarize_batch(batch, is_truncated=True)
+                    else:
+                        print(f"    [batch summarize] failed even after truncation: {exc}")
+                        break
+            elif "429" in err_str or "rate limit" in err_str:
                 sleep_time = 15 * (attempt + 1)
                 print(f"    [batch summarize] Rate limit hit. Sleeping {sleep_time}s...")
                 time.sleep(sleep_time)
@@ -237,15 +301,16 @@ def generate_table_summaries_batch(tables: list, cache: dict) -> list:
         return results
 
     n_cached = len(tables) - len(uncached_indices)
-    n_calls  = -(-len(uncached_indices) // _BATCH_SIZE)
+    n_calls  = -(-len(uncached_indices) // MAX_SUMMARY_BATCH_SIZE)
     print(f"    [summarize] {len(uncached_indices)} table(s) need summarization ({n_cached} from cache) => {n_calls} API call(s)")
 
     uncached_items = [tables[i] for i in uncached_indices]
-    for batch_start in range(0, len(uncached_items), _BATCH_SIZE):
-        batch = uncached_items[batch_start: batch_start + _BATCH_SIZE]
+    for batch_start in range(0, len(uncached_items), MAX_SUMMARY_BATCH_SIZE):
+        batch = uncached_items[batch_start: batch_start + MAX_SUMMARY_BATCH_SIZE]
         batch_summaries = _summarize_batch(batch)
 
         if batch_summaries and len(batch_summaries) == len(batch):
+            print("    [batch summarize] Success.")
             for j, summary in enumerate(batch_summaries):
                 global_idx = uncached_indices[batch_start + j]
                 results[global_idx] = summary
