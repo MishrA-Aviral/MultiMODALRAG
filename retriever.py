@@ -593,8 +593,8 @@ def answer_query(query: str, vectorstore, source_filter: str = None) -> str:
             if r.metadata.get("type") == "image" and "image_path" in r.metadata:
                 image_tags.append(f"[Source Image: {r.metadata['image_path']}]")
         if image_tags:
-            return "\n\n".join(image_tags)
-        return "No relevant image found in the document."
+            return {"answer": "\n\n".join(image_tags), "mode": mode, "intent": intent}
+        return {"answer": "No relevant image found in the document.", "mode": mode, "intent": intent}
 
     mode = "hybrid" if intent.get("wants_table_data") and intent.get("needs_analysis") else ("table" if intent.get("wants_table_data") else "text")
 
@@ -753,7 +753,7 @@ Answer:"""
         if "[Source Image:" not in answer and referenced_images:
             answer += f"\n\n[Source Image: {referenced_images[0]}]"
 
-    return answer
+    return {"answer": answer, "mode": mode, "intent": intent}
 
 # --- TEST 3: BM25 Tokenizer Check ---
 if __name__ == "__main__":

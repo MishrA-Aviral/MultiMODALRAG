@@ -74,12 +74,19 @@ def run_pipeline(excel_path: str = "Queries.xlsx"):
             print(f"  Q: {q} [filter: {source_filter}]")
             
             try:
-                answer = answer_query(q, vectorstore, source_filter=source_filter)
-                safe_ans = answer[:150].encode('cp1252', 'replace').decode('cp1252')
+                result = answer_query(q, vectorstore, source_filter=source_filter)
+                if isinstance(result, dict):
+                    ans_text = result["answer"]
+                    answer = result
+                else:
+                    ans_text = result
+                    answer = {"answer": result, "mode": "text", "intent": {}}
+                
+                safe_ans = ans_text[:150].encode('cp1252', 'replace').decode('cp1252')
                 print(f"  A: {safe_ans}...")
             except Exception as e:
                 print(f"  [ERROR] {e}")
-                answer = f"ERROR: {e}"
+                answer = {"answer": f"ERROR: {e}", "mode": "text", "intent": {}}
                 
             sheet_answers[idx] = answer
             answers[sheet] = sheet_answers

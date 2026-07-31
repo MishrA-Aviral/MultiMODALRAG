@@ -176,14 +176,27 @@ def write_answers(filepath: str, answers: dict, all_queries: dict):
         # Tables start well below the last query row (+ 3 blank rows gap)
         current_table_row = total_queries + 4
 
-        for i, answer in enumerate(qa_pairs, start=2):
+        for i, ans_obj in enumerate(qa_pairs, start=2):
             q_text = original_queries[i-2]["query"] if (i-2) < len(original_queries) else ""
+            
+            if isinstance(ans_obj, dict):
+                answer_text = ans_obj.get("answer", "")
+                mode = ans_obj.get("mode", "text")
+                wants_image_data = ans_obj.get("intent", {}).get("wants_image_data", False)
+            else:
+                answer_text = ans_obj
+                mode = "text"
+                wants_image_data = False
             
             # Write the query in Col A
             ws.cell(row=i, column=1, value=q_text)
 
             # Strip citation markers; extract image path if present
-            clean_answer, image_path = _extract_image_path(answer)
+            clean_answer, image_path = _extract_image_path(answer_text)
+
+            # Do not embed images for text or table queries unless explicitly requested
+            if mode in ["text", "table"] and not wants_image_data:
+                image_path = None
 
             lines = [line for line in clean_answer.split('\n')]
             table_lines = [line.strip() for line in lines if line.strip().startswith('|')]
